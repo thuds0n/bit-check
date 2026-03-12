@@ -193,6 +193,7 @@ struct SpectrogramPresentation: Identifiable {
     let reportedBitrate: String
     let reportedSampleRateHz: Int
     let durationSeconds: Double
+    let cutoffHz: Double?
 }
 
 private struct SpectrogramDetailView: View {
@@ -272,6 +273,27 @@ private struct SpectrogramDetailView: View {
                                             }
                                         }
                                         .stroke(Color.black.opacity(0.40), lineWidth: 1)
+                                    }
+                                }
+                            }
+                            .overlay(alignment: .top) {
+                                if let cutoffHz = presentation.cutoffHz, cutoffHz > 0 {
+                                    GeometryReader { imageGeo in
+                                        let yFraction = max(0, min(1, 1.0 - cutoffHz / 22_000.0))
+                                        let y = (yFraction * imageGeo.size.height).rounded()
+                                        ZStack(alignment: .topLeading) {
+                                            Path { path in
+                                                path.move(to: CGPoint(x: 0, y: y))
+                                                path.addLine(to: CGPoint(x: imageGeo.size.width, y: y))
+                                            }
+                                            .stroke(Color.yellow.opacity(0.90), lineWidth: 1.5)
+                                            Text(String(format: "%.1f kHz", cutoffHz / 1_000.0))
+                                                .font(.caption2)
+                                                .foregroundStyle(Color.yellow)
+                                                .padding(.horizontal, 4)
+                                                .background(Color.black.opacity(0.50))
+                                                .position(x: imageGeo.size.width - 36, y: y - 8)
+                                        }
                                     }
                                 }
                             }
@@ -636,7 +658,8 @@ final class ValidationViewModel: ObservableObject {
                 state: .pending,
                 reportedBitrate: existing.reportedBitrate,
                 bitrateMode: existing.bitrateMode,
-                fileType: displayFileType(for: $0)
+                fileType: displayFileType(for: $0),
+                cutoffHz: nil
             )
         }
 
@@ -655,6 +678,7 @@ final class ValidationViewModel: ObservableObject {
             updatedResults[index].analysisStatus = result.analysisStatus
             updatedResults[index].reportedBitrate = result.reportedBitrate
             updatedResults[index].bitrateMode = result.bitrateMode
+            updatedResults[index].cutoffHz = result.cutoffHz
             results = updatedResults
 
             if trainingModeEnabled {
@@ -744,7 +768,8 @@ final class ValidationViewModel: ObservableObject {
             state: .pending,
             reportedBitrate: metadata.reportedBitrate,
             bitrateMode: metadata.bitrateMode,
-            fileType: displayFileType(for: file)
+            fileType: displayFileType(for: file),
+            cutoffHz: nil
         )
     }
 
@@ -805,13 +830,15 @@ final class ValidationViewModel: ObservableObject {
                 try SpectrogramRenderer.render(fileURL: url)
             }.value
             let metadata = metadata(for: url)
+            let cutoffHz = results.first(where: { $0.fileURL == url })?.cutoffHz
             let presentation = SpectrogramPresentation(
                 fileURL: url,
                 image: renderOutput.image,
                 fileType: displayFileType(for: url),
                 reportedBitrate: metadata.reportedBitrate,
                 reportedSampleRateHz: renderOutput.sampleRateHz,
-                durationSeconds: renderOutput.durationSeconds
+                durationSeconds: renderOutput.durationSeconds,
+                cutoffHz: cutoffHz
             )
             SpectrogramWindowManager.shared.present(presentation)
             statusMessage = "Rendered spectrogram for \(url.lastPathComponent)."
@@ -910,7 +937,8 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
                     analysisStatus: "Audio too short",
                     reportedBitrate: samples.reportedBitrate,
                     bitrateMode: samples.bitrateMode,
-                    features: nil
+                    features: nil,
+                    cutoffHz: nil
                 )
             }
 
@@ -923,7 +951,8 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
                 analysisStatus: estimate.status,
                 reportedBitrate: samples.reportedBitrate,
                 bitrateMode: samples.bitrateMode,
-                features: estimate.features
+                features: estimate.features,
+                cutoffHz: estimate.cutoffHz
             )
         } catch {
             return RunResult(
@@ -934,7 +963,8 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
                 analysisStatus: "Error: \(error.localizedDescription)",
                 reportedBitrate: "N/A",
                 bitrateMode: "Unknown",
-                features: nil
+                features: nil,
+                cutoffHz: nil
             )
         }
     }
@@ -1182,16 +1212,15 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
 
         let stability = stabilityScore(segmentCutoffRatios)
         let dropScore = normalized(value: Double(dropAmount), minValue: 0.30, maxValue: 2.60)
-        let linearSpectrum = averagedSpectrum
-        let lowBandStart = min(linearSpectrum.count - 1, 5)
+        let lowBandStart = min(averagedSpectrum.count - 1, 5)
         let lowBandEnd = max(lowBandStart + 1, cutoffIndex)
         let highBandStart = min(
-            linearSpectrum.count - 1,
-            cutoffIndex + max(4, Int(Double(linearSpectrum.count) * 0.03))
+            averagedSpectrum.count - 1,
+            cutoffIndex + max(4, Int(Double(averagedSpectrum.count) * 0.03))
         )
-        let highBandEnd = max(highBandStart + 1, linearSpectrum.count)
-        let lowBand = Array(linearSpectrum[lowBandStart..<lowBandEnd])
-        let highBand = Array(linearSpectrum[highBandStart..<highBandEnd])
+        let highBandEnd = max(highBandStart + 1, averagedSpectrum.count)
+        let lowBand = Array(averagedSpectrum[lowBandStart..<lowBandEnd])
+        let highBand = Array(averagedSpectrum[highBandStart..<highBandEnd])
         let lowMean = Double(lowBand.reduce(0, +)) / Double(max(lowBand.count, 1))
         let highMean = Double(highBand.reduce(0, +)) / Double(max(highBand.count, 1))
         let highBandRatio = highMean / max(lowMean, 1.0e-12)
@@ -1544,6 +1573,11 @@ private nonisolated struct BitrateEstimate {
             return "Inconclusive"
         }
         if inferredBitrate == "lossless" {
+            // 0.92–0.95 is a borderline zone: the spectrum almost reaches Nyquist but not
+            // convincingly enough to call it clean lossless with high confidence.
+            if cutoffRatio < 0.95 {
+                return "Possibly lossless (borderline)"
+            }
             return "Likely lossless"
         }
         // Lossless container (FLAC/WAV/AIFF) with a premature spectral cutoff —
@@ -1593,6 +1627,7 @@ private struct RunResult {
     let reportedBitrate: String
     let bitrateMode: String
     let features: AnalysisFeatures?
+    let cutoffHz: Double?
 }
 
 struct AnalysisFeatures {
@@ -1701,6 +1736,7 @@ struct ValidationResult: Identifiable {
     var reportedBitrate: String
     var bitrateMode: String
     var fileType: String
+    var cutoffHz: Double?
 
     var sortFileName: String {
         fileURL.lastPathComponent.lowercased()

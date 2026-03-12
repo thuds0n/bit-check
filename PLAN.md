@@ -67,10 +67,10 @@ Full detail in `BITRATE_CALCULATION.md`.
 - Confidence scoring (drop sharpness, segment stability, suppression above cutoff)
 - Training Mode with CSV export (for future native-labeled calibration)
 - Batch file/folder scanning with table UI
+- **Spectrogram cutoff overlay** — yellow horizontal line drawn at detected cutoff frequency with kHz label; visible when opening "View Spectrogram" after running analysis
+- **Borderline lossless status** — cutoffRatio 0.92–0.95 now shows "Possibly lossless (borderline)" instead of "Likely lossless"; confidence already capped at 70% for this zone
 
 ### 🔜 Next
-- **Spectrogram cutoff overlay** — draw a horizontal line on the spectrogram at the detected cutoff frequency so users can visually confirm the "wall"
-- **Better confidence for borderline files** — currently 0.92 cutoffRatio threshold is binary; could blend into a "probably lossless / uncertain" zone around 0.90–0.95
 - **AAC/Opus improvements** — thresholds were tuned for MP3; AAC and Opus have different filter shapes and may need separate bucket tuning
 - **Re-calibration with native labels** — build a labeled dataset using files with known provenance (not FTF output), run through Training Mode, tune thresholds using `calibrate.py`
 
