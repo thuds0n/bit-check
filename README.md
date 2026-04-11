@@ -46,7 +46,7 @@ Click any analysed file to open its spectrogram — frequency on the Y axis (0 t
 
 ## Algorithm
 
-See `BITRATE_CALCULATION.md` for the full specification.
+See `CALCULATIONS.md` for the full specification.
 
 Short version:
 

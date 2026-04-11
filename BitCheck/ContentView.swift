@@ -188,7 +188,8 @@ private struct DropArea: View {
 struct SpectrogramPresentation: Identifiable {
     let id = UUID()
     let fileURL: URL
-    let image: NSImage
+    let logImage: NSImage
+    let linearImage: NSImage
     let fileType: String
     let reportedBitrate: String
     let reportedSampleRateHz: Int
@@ -199,9 +200,13 @@ struct SpectrogramPresentation: Identifiable {
 private struct SpectrogramDetailView: View {
     let presentation: SpectrogramPresentation
     @State private var showHorizontalGridLines = false
-    private let yTickCount = 12 // 0...22 kHz in 2 kHz steps
+    @State private var darkBackground = true
+    @State private var logScale = true
+    private let logFreqTicks: [Double] = [20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50, 20]
+    private let minFreqHz: Double = 20.0
     private let xTickCount = 11
     private let yAxisWidth: CGFloat = 58
+    private let legendWidth: CGFloat = 50
     private let axisStroke = Color.secondary.opacity(0.75)
 
     var body: some View {
@@ -217,9 +222,17 @@ private struct SpectrogramDetailView: View {
                 .foregroundStyle(.secondary)
             }
 
-            Toggle("Show horizontal grid lines", isOn: $showHorizontalGridLines)
-                .toggleStyle(.switch)
-                .font(.caption)
+            HStack(spacing: 20) {
+                Toggle("Show grid lines", isOn: $showHorizontalGridLines)
+                    .toggleStyle(.switch)
+                    .font(.caption)
+                Toggle("Log scale", isOn: $logScale)
+                    .toggleStyle(.switch)
+                    .font(.caption)
+                Toggle("Dark background", isOn: $darkBackground)
+                    .toggleStyle(.switch)
+                    .font(.caption)
+            }
 
             GeometryReader { proxy in
                 let xAxisBlockHeight: CGFloat = 42
@@ -236,18 +249,17 @@ private struct SpectrogramDetailView: View {
                                         path.move(to: CGPoint(x: axisGeo.size.width, y: 0))
                                         path.addLine(to: CGPoint(x: axisGeo.size.width, y: axisGeo.size.height))
 
-                                        for index in 0..<yTickCount {
-                                            let y = yTickPosition(index: index, height: axisGeo.size.height)
+                                        for freq in activeFreqTicks {
+                                            let y = yTickPosition(freqHz: freq, height: axisGeo.size.height)
                                             path.move(to: CGPoint(x: axisGeo.size.width - 7, y: y))
                                             path.addLine(to: CGPoint(x: axisGeo.size.width, y: y))
                                         }
                                     }
                                     .stroke(axisStroke, lineWidth: 1)
 
-                                    ForEach(0..<yTickCount, id: \.self) { index in
-                                        let y = yTickPosition(index: index, height: axisGeo.size.height)
-                                        let khz = (yTickCount - 1 - index) * 2
-                                        Text("\(khz) kHz")
+                                    ForEach(activeFreqTicks, id: \.self) { freq in
+                                        let y = yTickPosition(freqHz: freq, height: axisGeo.size.height)
+                                        Text(formatFreqLabel(freq))
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                             .frame(width: axisGeo.size.width - 11, alignment: .trailing)
@@ -257,48 +269,53 @@ private struct SpectrogramDetailView: View {
                             }
                         }
 
-                        Image(nsImage: presentation.image)
-                            .resizable()
-                            .interpolation(.none)
-                            .frame(maxWidth: .infinity, minHeight: imageHeight, maxHeight: imageHeight)
-                            .clipped()
-                            .overlay(alignment: .top) {
-                                if showHorizontalGridLines {
-                                    GeometryReader { imageGeo in
+                        ZStack(alignment: .topLeading) {
+                            (darkBackground ? Color.black : Color.white)
+
+                            Image(nsImage: activeImage)
+                                .resizable()
+                                .interpolation(.none)
+                                .frame(maxWidth: .infinity, minHeight: imageHeight, maxHeight: imageHeight)
+                                .clipped()
+
+                            if showHorizontalGridLines {
+                                GeometryReader { imageGeo in
+                                    Path { path in
+                                        for freq in activeFreqTicks {
+                                            let y = yTickPosition(freqHz: freq, height: imageGeo.size.height)
+                                            path.move(to: CGPoint(x: 0, y: y))
+                                            path.addLine(to: CGPoint(x: imageGeo.size.width, y: y))
+                                        }
+                                    }
+                                    .stroke(Color.black.opacity(0.40), lineWidth: 1)
+                                }
+                            }
+
+                            if let cutoffHz = presentation.cutoffHz, cutoffHz > 0 {
+                                GeometryReader { imageGeo in
+                                    let y = yTickPosition(freqHz: cutoffHz, height: imageGeo.size.height)
+                                    ZStack(alignment: .topLeading) {
                                         Path { path in
-                                            for index in 0..<yTickCount {
-                                                let y = yTickPosition(index: index, height: imageGeo.size.height)
-                                                path.move(to: CGPoint(x: 0, y: y))
-                                                path.addLine(to: CGPoint(x: imageGeo.size.width, y: y))
-                                            }
+                                            path.move(to: CGPoint(x: 0, y: y))
+                                            path.addLine(to: CGPoint(x: imageGeo.size.width, y: y))
                                         }
-                                        .stroke(Color.black.opacity(0.40), lineWidth: 1)
+                                        .stroke(Color.yellow.opacity(0.90), lineWidth: 1.5)
+                                        Text(String(format: "%.1f kHz", cutoffHz / 1_000.0))
+                                            .font(.caption2)
+                                            .foregroundStyle(Color.yellow)
+                                            .padding(.horizontal, 4)
+                                            .background(Color.black.opacity(0.50))
+                                            .position(x: imageGeo.size.width - 36, y: y - 8)
                                     }
                                 }
                             }
-                            .overlay(alignment: .top) {
-                                if let cutoffHz = presentation.cutoffHz, cutoffHz > 0 {
-                                    GeometryReader { imageGeo in
-                                        let yFraction = max(0, min(1, 1.0 - cutoffHz / 22_000.0))
-                                        let y = (yFraction * imageGeo.size.height).rounded()
-                                        ZStack(alignment: .topLeading) {
-                                            Path { path in
-                                                path.move(to: CGPoint(x: 0, y: y))
-                                                path.addLine(to: CGPoint(x: imageGeo.size.width, y: y))
-                                            }
-                                            .stroke(Color.yellow.opacity(0.90), lineWidth: 1.5)
-                                            Text(String(format: "%.1f kHz", cutoffHz / 1_000.0))
-                                                .font(.caption2)
-                                                .foregroundStyle(Color.yellow)
-                                                .padding(.horizontal, 4)
-                                                .background(Color.black.opacity(0.50))
-                                                .position(x: imageGeo.size.width - 36, y: y - 8)
-                                        }
-                                    }
-                                }
-                            }
-                            .background(Color.black.opacity(0.12))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                        .frame(maxWidth: .infinity, minHeight: imageHeight, maxHeight: imageHeight)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+
+                        dbLegendView
+                            .frame(width: legendWidth, height: imageHeight)
+                            .padding(.leading, 6)
                     }
 
                     HStack(spacing: 0) {
@@ -339,6 +356,8 @@ private struct SpectrogramDetailView: View {
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .center)
                         }
+                        // Spacer matching legend width so time axis aligns under the image
+                        Color.clear.frame(width: legendWidth + 6)
                     }
                 }
             }
@@ -354,9 +373,76 @@ private struct SpectrogramDetailView: View {
         return String(format: "%d:%02d", minutes, remainder)
     }
 
-    private func yTickPosition(index: Int, height: CGFloat) -> CGFloat {
-        let divisor = CGFloat(max(yTickCount - 1, 1))
-        return (height * CGFloat(index) / divisor).rounded()
+    private var nyquistHz: Double { Double(presentation.reportedSampleRateHz) / 2.0 }
+
+    private var activeImage: NSImage { logScale ? presentation.logImage : presentation.linearImage }
+
+    /// Linear ticks at 2 kHz steps from 0 up to Nyquist
+    private var linearFreqTicks: [Double] {
+        stride(from: 0.0, through: nyquistHz, by: 2000.0).map { $0 }
+    }
+
+    private var activeFreqTicks: [Double] {
+        logScale ? logFreqTicks.filter { $0 <= nyquistHz } : linearFreqTicks
+    }
+
+    private func yTickPosition(freqHz: Double, height: CGFloat) -> CGFloat {
+        if logScale {
+            let logFrac = log(max(freqHz, minFreqHz) / minFreqHz) / log(nyquistHz / minFreqHz)
+            let frac = 1.0 - logFrac
+            return (height * CGFloat(max(0.0, min(1.0, frac)))).rounded()
+        } else {
+            let frac = 1.0 - freqHz / nyquistHz
+            return (height * CGFloat(max(0.0, min(1.0, frac)))).rounded()
+        }
+    }
+
+    private func formatFreqLabel(_ hz: Double) -> String {
+        hz >= 1_000 ? "\(Int(hz / 1_000)) kHz" : "\(Int(hz)) Hz"
+    }
+
+    // Gradient stops match colourMap, reversed so top = 0 dB (white) and bottom = -120 dB (black)
+    private let dbGradientStops: [Gradient.Stop] = [
+        .init(color: .white,                                          location: 0.000), // 0 dB
+        .init(color: Color(red: 1,       green: 1,     blue: 0),     location: 0.222), // yellow
+        .init(color: Color(red: 1,       green: 100/255, blue: 0),   location: 0.444), // orange
+        .init(color: Color(red: 88/255,  green: 0,     blue: 88/255), location: 0.667), // dark purple
+        .init(color: .black,                                          location: 1.000), // -120 dB
+    ]
+
+    private var dbLegendView: some View {
+        Color.clear
+            .overlay {
+                GeometryReader { geo in
+                    ZStack(alignment: .topLeading) {
+                        // Colour gradient bar
+                        LinearGradient(stops: dbGradientStops, startPoint: .top, endPoint: .bottom)
+                            .frame(width: 10, height: geo.size.height)
+                            .clipShape(RoundedRectangle(cornerRadius: 2))
+                            .position(x: 5, y: geo.size.height / 2)
+
+                        // Tick marks on right edge of bar
+                        Path { path in
+                            for db in stride(from: 0.0, through: -120.0, by: -20.0) {
+                                let y = (-db / 120.0) * geo.size.height
+                                path.move(to: CGPoint(x: 10, y: y))
+                                path.addLine(to: CGPoint(x: 14, y: y))
+                            }
+                        }
+                        .stroke(axisStroke, lineWidth: 1)
+
+                        // dB labels
+                        ForEach(stride(from: 0.0, through: -120.0, by: -20.0).map { $0 }, id: \.self) { db in
+                            let y = ((-db / 120.0) * geo.size.height).rounded()
+                            Text(db == 0 ? "0 dB" : "\(Int(db))")
+                                .font(.system(size: 8))
+                                .foregroundStyle(.secondary)
+                                .frame(width: legendWidth - 17, alignment: .leading)
+                                .position(x: 17 + (legendWidth - 17) / 2, y: y)
+                        }
+                    }
+                }
+            }
     }
 
     private func xTickPosition(index: Int, width: CGFloat) -> CGFloat {
@@ -443,7 +529,12 @@ private nonisolated enum SpectrogramRenderer {
         var real = [Float](repeating: 0, count: freqBins)
         var imag = [Float](repeating: 0, count: freqBins)
         var magnitudes = [Float](repeating: 0, count: freqBins)
-        var intensities = [Float](repeating: 0, count: timeBins * displayHeight)
+        var logIntensities = [Float](repeating: 0, count: timeBins * displayHeight)
+        var linearIntensities = [Float](repeating: 0, count: timeBins * displayHeight)
+        let nyquistHz = Double(sampleRate) / 2.0
+        let minFreqHz = 20.0
+        let logMin = log(minFreqHz)
+        let logMax = log(nyquistHz)
 
         for frame in 0..<timeBins {
             let start = frame * hopLength
@@ -451,19 +542,13 @@ private nonisolated enum SpectrogramRenderer {
             var windowed = Array(samples[start..<end])
             vDSP.multiply(windowed, hannWindow, result: &windowed)
 
-            var interleaved = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: freqBins)
-            for index in 0..<freqBins {
-                interleaved[index] = DSPComplex(real: windowed[index * 2], imag: windowed[index * 2 + 1])
-            }
-
             real.withUnsafeMutableBufferPointer { realPointer in
                 imag.withUnsafeMutableBufferPointer { imagPointer in
                     guard let realBase = realPointer.baseAddress, let imagBase = imagPointer.baseAddress else { return }
                     var split = DSPSplitComplex(realp: realBase, imagp: imagBase)
-                    interleaved.withUnsafeBufferPointer { pointer in
-                        guard let baseAddress = pointer.baseAddress else { return }
-                        baseAddress.withMemoryRebound(to: DSPComplex.self, capacity: freqBins) { reboundPointer in
-                            vDSP_ctoz(reboundPointer, 1, &split, 1, vDSP_Length(freqBins))
+                    windowed.withUnsafeBufferPointer { windowedPtr in
+                        windowedPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: freqBins) { complexPtr in
+                            vDSP_ctoz(complexPtr, 2, &split, 1, vDSP_Length(freqBins))
                         }
                     }
                     fft.forward(input: split, output: &split)
@@ -471,16 +556,31 @@ private nonisolated enum SpectrogramRenderer {
                 }
             }
 
+            // Reference level: expected peak magnitude for a full-scale sine through a Hann window
+            // equals N/4 (where N = fftLength). Dividing normalises to dBFS so 0 dBFS → white.
+            let refLevel = Double(fftLength / 4)
+
+            // Log-scale image (20 Hz → Nyquist, logarithmic)
             for y in 0..<displayHeight {
-                let bin = Int((Double(y) / Double(max(displayHeight - 1, 1))) * Double(freqBins - 1))
-                let db = 20.0 * log10(Double(max(magnitudes[bin], 1.0e-12)))
-                let normalized = Float(max(0.0, min(1.0, (db + 90.0) / 90.0)))
-                intensities[(y * timeBins) + frame] = normalized
+                let freqHz = exp(logMin + (logMax - logMin) * Double(y) / Double(max(displayHeight - 1, 1)))
+                let bin = max(0, min(freqBins - 1, Int((freqHz / nyquistHz * Double(freqBins - 1)).rounded())))
+                let dbFS = 20.0 * log10(Double(max(magnitudes[bin], 1.0e-12)) / refLevel)
+                let normalized = Float(max(0.0, min(1.0, (dbFS + 120.0) / 120.0)))
+                logIntensities[(y * timeBins) + frame] = normalized
+            }
+
+            // Linear-scale image (0 Hz → Nyquist, linear)
+            for y in 0..<displayHeight {
+                let bin = max(0, min(freqBins - 1, Int((Double(y) / Double(max(displayHeight - 1, 1)) * Double(freqBins - 1)).rounded())))
+                let dbFS = 20.0 * log10(Double(max(magnitudes[bin], 1.0e-12)) / refLevel)
+                let normalized = Float(max(0.0, min(1.0, (dbFS + 120.0) / 120.0)))
+                linearIntensities[(y * timeBins) + frame] = normalized
             }
         }
 
         return SpectrogramRenderOutput(
-            image: try makeImage(intensities: intensities, width: timeBins, height: displayHeight),
+            logImage: try makeImage(intensities: logIntensities, width: timeBins, height: displayHeight),
+            linearImage: try makeImage(intensities: linearIntensities, width: timeBins, height: displayHeight),
             sampleRateHz: sampleRate,
             durationSeconds: durationSeconds
         )
@@ -510,10 +610,13 @@ private nonisolated enum SpectrogramRenderer {
                 let value = intensities[(y * width) + x]
                 let colour = colourMap(value)
                 let offset = ((y * width) + x) * 4
-                pixels[offset] = colour.r
-                pixels[offset + 1] = colour.g
-                pixels[offset + 2] = colour.b
-                pixels[offset + 3] = 255
+                // Alpha fades near-silence to transparent; fully opaque at value >= 0.1 (≈ −108 dBFS)
+                let alpha = min(1.0, value * 10.0)
+                // Premultiply RGB by alpha for correct compositing
+                pixels[offset] = UInt8((Float(colour.r) * alpha).rounded())
+                pixels[offset + 1] = UInt8((Float(colour.g) * alpha).rounded())
+                pixels[offset + 2] = UInt8((Float(colour.b) * alpha).rounded())
+                pixels[offset + 3] = UInt8((alpha * 255.0).rounded())
             }
         }
 
@@ -542,15 +645,34 @@ private nonisolated enum SpectrogramRenderer {
 
     private static func colourMap(_ value: Float) -> (r: UInt8, g: UInt8, b: UInt8) {
         let v = max(0.0, min(1.0, value))
-        let r = UInt8(max(0.0, min(255.0, 255.0 * pow(v, 0.50))))
-        let g = UInt8(max(0.0, min(255.0, 255.0 * pow(v, 1.20))))
-        let b = UInt8(max(0.0, min(255.0, 255.0 * pow(v, 2.10))))
-        return (r, g, b)
+        // Spek palette: black (-120 dB) → dark purple → orange → yellow → white (0 dB)
+        typealias Stop = (pos: Float, r: Float, g: Float, b: Float)
+        let stops: [Stop] = [
+            (0.000,   0,   0,   0),   // black
+            (0.333,  88,   0,  88),   // dark purple
+            (0.556, 255, 100,   0),   // orange
+            (0.778, 255, 255,   0),   // yellow
+            (1.000, 255, 255, 255),   // white
+        ]
+        var lo = stops[0]
+        var hi = stops[stops.count - 1]
+        for i in 0..<(stops.count - 1) where v >= stops[i].pos && v <= stops[i + 1].pos {
+            lo = stops[i]; hi = stops[i + 1]
+            break
+        }
+        let range = hi.pos - lo.pos
+        let t = range > 0 ? (v - lo.pos) / range : 0
+        return (
+            UInt8((lo.r + t * (hi.r - lo.r)).rounded()),
+            UInt8((lo.g + t * (hi.g - lo.g)).rounded()),
+            UInt8((lo.b + t * (hi.b - lo.b)).rounded())
+        )
     }
 }
 
 private struct SpectrogramRenderOutput {
-    let image: NSImage
+    let logImage: NSImage
+    let linearImage: NSImage
     let sampleRateHz: Int
     let durationSeconds: Double
 }
@@ -833,7 +955,8 @@ final class ValidationViewModel: ObservableObject {
             let cutoffHz = results.first(where: { $0.fileURL == url })?.cutoffHz
             let presentation = SpectrogramPresentation(
                 fileURL: url,
-                image: renderOutput.image,
+                logImage: renderOutput.logImage,
+                linearImage: renderOutput.linearImage,
                 fileType: displayFileType(for: url),
                 reportedBitrate: metadata.reportedBitrate,
                 reportedSampleRateHz: renderOutput.sampleRateHz,
@@ -1114,22 +1237,24 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
         }
     }
 
+    // MARK: - Welch's Method Spectral Analysis
+
+    private static let analysisFFTLength = 8192
+    private static let analysisHopFraction = 0.5 // 50% overlap
+
     private static func estimateBitrate(from audio: AudioSamples) throws -> BitrateEstimate {
         let sampleRate = audio.sampleRate
-        let windowLength = samplesPerWindow(sampleRate)
-        let segmentCount = min(audio.channel.count / windowLength, 30)
-        guard segmentCount > 0 else {
-            throw AnalyzerError.noAudioData
-        }
-
-        let fftLength = largestPowerOfTwo(atMost: windowLength)
-        guard fftLength >= 1024 else {
-            throw AnalyzerError.insufficientSamples
-        }
-
-        let frequencyResolution = Double(sampleRate) / Double(fftLength)
+        let fftLength = analysisFFTLength
+        let hopLength = Int(Double(fftLength) * analysisHopFraction)
+        let freqBins = fftLength / 2
         let nyquistHz = Double(sampleRate) / 2.0
+        let frequencyResolution = Double(sampleRate) / Double(fftLength)
         let profile = audio.codecProfile
+
+        let maxSegments = (audio.channel.count - fftLength) / hopLength + 1
+        guard maxSegments > 0 else { throw AnalyzerError.noAudioData }
+        let segmentCount = min(maxSegments, 200)
+
         var hannWindow = [Float](repeating: 0, count: fftLength)
         vDSP_hann_window(&hannWindow, vDSP_Length(fftLength), Int32(vDSP_HANN_NORM))
 
@@ -1138,119 +1263,129 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
             throw AnalyzerError.fftSetupFailed
         }
 
-        var averagedSpectrum = [Float](repeating: 0, count: fftLength / 2)
-        var real = [Float](repeating: 0, count: fftLength / 2)
-        var imag = [Float](repeating: 0, count: fftLength / 2)
-        var magnitudes = [Float](repeating: 0, count: fftLength / 2)
+        // Accumulate power spectrum (squared magnitudes) — Welch's method
+        var averagedPower = [Float](repeating: 0, count: freqBins)
+        var real = [Float](repeating: 0, count: freqBins)
+        var imag = [Float](repeating: 0, count: freqBins)
+        var magnitudes = [Float](repeating: 0, count: freqBins)
+        var power = [Float](repeating: 0, count: freqBins)
         var segmentCutoffRatios: [Double] = []
 
-        for segmentIndex in 0..<segmentCount {
-            let start = segmentIndex * windowLength
+        for seg in 0..<segmentCount {
+            let start = seg * hopLength
             let end = start + fftLength
             guard end <= audio.channel.count else { break }
 
             var windowed = Array(audio.channel[start..<end])
             vDSP.multiply(windowed, hannWindow, result: &windowed)
 
-            var interleaved = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: fftLength / 2)
-            for i in 0..<(fftLength / 2) {
-                interleaved[i] = DSPComplex(real: windowed[i * 2], imag: windowed[i * 2 + 1])
-            }
-
-            real.withUnsafeMutableBufferPointer { realPointer in
-                imag.withUnsafeMutableBufferPointer { imagPointer in
-                    guard
-                        let realBase = realPointer.baseAddress,
-                        let imagBase = imagPointer.baseAddress
-                    else {
-                        return
-                    }
-
-                    var split = DSPSplitComplex(realp: realBase, imagp: imagBase)
-                    interleaved.withUnsafeBufferPointer { pointer in
-                        guard let baseAddress = pointer.baseAddress else { return }
-                        baseAddress.withMemoryRebound(to: DSPComplex.self, capacity: fftLength / 2) { reboundPointer in
-                            vDSP_ctoz(reboundPointer, 1, &split, 1, vDSP_Length(fftLength / 2))
+            real.withUnsafeMutableBufferPointer { rp in
+                imag.withUnsafeMutableBufferPointer { ip in
+                    guard let rb = rp.baseAddress, let ib = ip.baseAddress else { return }
+                    var split = DSPSplitComplex(realp: rb, imagp: ib)
+                    windowed.withUnsafeBufferPointer { wp in
+                        wp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: freqBins) { cp in
+                            vDSP_ctoz(cp, 2, &split, 1, vDSP_Length(freqBins))
                         }
                     }
-
                     fft.forward(input: split, output: &split)
-                    vDSP_zvabs(&split, 1, &magnitudes, 1, vDSP_Length(fftLength / 2))
+                    vDSP_zvabs(&split, 1, &magnitudes, 1, vDSP_Length(freqBins))
                 }
             }
 
-            let localDb = magnitudes.map { log10f(max($0, 1.0e-12)) }
-            let localSmoothed = movingAverage(localDb, window: max(3, fftLength / 100))
-            let localCutoff = estimateCutoffIndex(from: localSmoothed, thresholdDrop: profile.thresholdDropDB)
-            segmentCutoffRatios.append((Double(localCutoff) * frequencyResolution) / nyquistHz)
-            vDSP.add(averagedSpectrum, magnitudes, result: &averagedSpectrum)
+            // Squared magnitudes → power spectrum
+            vDSP.multiply(magnitudes, magnitudes, result: &power)
+            vDSP.add(averagedPower, power, result: &averagedPower)
+
+            // Per-segment cutoff for stability analysis
+            let localDb = power.map { 10.0 * log10f(max($0, 1.0e-24)) }
+            let localSmoothed = movingAverage(localDb, window: max(3, freqBins / 80))
+            let localCutoff = cutoffGradient(spectrum: localSmoothed, frequencyResolution: frequencyResolution)
+            segmentCutoffRatios.append(localCutoff / nyquistHz)
         }
 
-        let scaling = Float(1.0 / Double(segmentCount))
-        vDSP.multiply(scaling, averagedSpectrum, result: &averagedSpectrum)
+        let actualSegments = min(segmentCount, (audio.channel.count - fftLength) / hopLength + 1)
+        let scaling = Float(1.0 / Double(max(actualSegments, 1)))
+        vDSP.multiply(scaling, averagedPower, result: &averagedPower)
 
-        for i in averagedSpectrum.indices {
-            averagedSpectrum[i] = log10f(max(averagedSpectrum[i], 1.0e-12))
+        // Convert averaged power to dB
+        var spectrumDb = [Float](repeating: 0, count: freqBins)
+        for i in 0..<freqBins {
+            spectrumDb[i] = 10.0 * log10f(max(averagedPower[i], 1.0e-24))
         }
+        let smoothed = movingAverage(spectrumDb, window: max(3, freqBins / 80))
 
-        let smoothed = movingAverage(averagedSpectrum, window: max(3, fftLength / 100))
-        let cutoffIndex = estimateCutoffIndex(from: smoothed, thresholdDrop: profile.thresholdDropDB)
-        let cutoffHz = Double(cutoffIndex) * frequencyResolution
+        // --- Multi-method cutoff detection ---
+        let cutoffA = cutoffGradient(spectrum: smoothed, frequencyResolution: frequencyResolution)
+        let cutoffB = cutoffEnergyRatio(powerSpectrum: averagedPower, frequencyResolution: frequencyResolution)
+        let cutoffC = cutoffNoiseFloor(spectrumDb: smoothed, frequencyResolution: frequencyResolution, nyquistHz: nyquistHz)
 
-        let cutoffRatio = cutoffHz / nyquistHz
-        let transitionWidth = max(8, Int(Double(smoothed.count) * 0.02))
-        let preStart = max(0, cutoffIndex - transitionWidth)
-        let preEnd = max(preStart + 1, cutoffIndex)
-        let postStart = min(smoothed.count - 1, cutoffIndex + 2)
-        let postEnd = min(smoothed.count, postStart + transitionWidth)
+        // Fused cutoff = median of three methods
+        let sortedCutoffs = [cutoffA, cutoffB, cutoffC].sorted()
+        let fusedCutoffHz = sortedCutoffs[1]
+        let cutoffSpread = sortedCutoffs[2] - sortedCutoffs[0]
+        let cutoffAgreement = 1.0 - normalized(value: cutoffSpread, minValue: 0, maxValue: 2000)
+        let cutoffRatio = fusedCutoffHz / nyquistHz
 
-        let preBand = Array(smoothed[preStart..<preEnd])
-        let postBand = postStart < postEnd ? Array(smoothed[postStart..<postEnd]) : []
-        let preMean = preBand.reduce(0, +) / Float(max(preBand.count, 1))
-        let postMean = postBand.isEmpty ? preMean : postBand.reduce(0, +) / Float(postBand.count)
-        let dropAmount = max(0, preMean - postMean)
+        // Shelf sharpness: dB drop across the cutoff region
+        let fusedIndex = max(0, min(freqBins - 1, Int((fusedCutoffHz / frequencyResolution).rounded())))
+        let shelfSharpness = computeShelfSharpness(spectrum: smoothed, cutoffIndex: fusedIndex)
 
+        // --- Sub-band energy analysis ---
+        let subBandResult = subBandAnalysis(powerSpectrum: averagedPower, sampleRate: sampleRate, freqBins: freqBins)
+
+        // --- Stability ---
         let stability = stabilityScore(segmentCutoffRatios)
-        let dropScore = normalized(value: Double(dropAmount), minValue: 0.30, maxValue: 2.60)
-        let lowBandStart = min(averagedSpectrum.count - 1, 5)
-        let lowBandEnd = max(lowBandStart + 1, cutoffIndex)
-        let highBandStart = min(
-            averagedSpectrum.count - 1,
-            cutoffIndex + max(4, Int(Double(averagedSpectrum.count) * 0.03))
-        )
-        let highBandEnd = max(highBandStart + 1, averagedSpectrum.count)
-        let lowBand = Array(averagedSpectrum[lowBandStart..<lowBandEnd])
-        let highBand = Array(averagedSpectrum[highBandStart..<highBandEnd])
-        let lowMean = Double(lowBand.reduce(0, +)) / Double(max(lowBand.count, 1))
-        let highMean = Double(highBand.reduce(0, +)) / Double(max(highBand.count, 1))
-        let highBandRatio = highMean / max(lowMean, 1.0e-12)
-        let suppressionScore = 1.0 - normalized(value: highBandRatio, minValue: 0.015, maxValue: 0.22)
-        let sampleSupport = normalized(value: Double(segmentCount), minValue: 6, maxValue: 24)
-        let evidenceConfidence = max(
-            0,
-            min(
-                1,
-                0.05
-                    + (0.38 * dropScore)
-                    + (0.30 * stability)
-                    + (0.20 * suppressionScore)
-                    + (0.07 * sampleSupport)
-            )
-        )
-        let roundedCutoffKHz = Int(cutoffHz / 1_000.0)
-        let classification = profile.classification(for: roundedCutoffKHz, cutoffRatio: cutoffRatio)
+        let sampleSupport = normalized(value: Double(actualSegments), minValue: 6, maxValue: 60)
 
-        // Confidence is evidence-led. Bucket fit refines confidence but cannot dominate weak evidence.
-        var confidence = (0.70 * evidenceConfidence) + (0.30 * classification.score)
-        if dropScore < 0.03, stability < 0.10 {
+        // --- Lossless discrimination (multi-feature) ---
+        let losslessScore =
+            0.25 * normalized(value: cutoffRatio, minValue: 0.90, maxValue: 1.00)
+            + 0.20 * (1.0 - shelfSharpness)
+            + 0.20 * normalized(value: subBandResult.highBandEnergyRatio, minValue: 0.001, maxValue: 0.02)
+            + 0.15 * normalized(value: subBandResult.airBandFlatness, minValue: 0.01, maxValue: 0.5)
+            + 0.10 * (1.0 - cutoffAgreement)
+            + 0.10 * (1.0 - stability)
+
+        // --- Classification ---
+        let classification: (label: String, score: Double)
+        if profile == .lossless {
+            if losslessScore > 0.65 {
+                classification = ("lossless", min(0.99, losslessScore))
+            } else {
+                classification = profile.classifyContinuous(cutoffHz: fusedCutoffHz, sampleRate: sampleRate)
+            }
+        } else {
+            classification = profile.classifyContinuous(cutoffHz: fusedCutoffHz, sampleRate: sampleRate)
+        }
+
+        // --- Confidence model ---
+        let highBandSuppression = 1.0 - normalized(
+            value: subBandResult.highBandEnergyRatio, minValue: 0.001, maxValue: 0.10
+        )
+        let evidenceConfidence = max(0, min(1,
+            0.05
+            + 0.25 * shelfSharpness
+            + 0.20 * stability
+            + 0.15 * highBandSuppression
+            + 0.15 * cutoffAgreement
+            + 0.10 * normalized(value: subBandResult.airBandFlatness, minValue: 0.0, maxValue: 0.3)
+            + 0.05 * sampleSupport
+            + 0.05 * normalized(value: shelfSharpness, minValue: 0.0, maxValue: 1.0)
+        ))
+
+        var confidence = 0.65 * evidenceConfidence + 0.35 * classification.score
+        // Penalties
+        if shelfSharpness < 0.05, stability < 0.10 {
             confidence *= 0.45
         }
-        if suppressionScore < 0.20 {
+        if highBandSuppression < 0.20 {
             confidence *= 0.75
         }
-        let highBitrateLike = classification.label == "192 kbps"
-            || classification.label == "224 kbps"
-            || classification.label == "320 kbps"
+        if cutoffAgreement < 0.30 {
+            confidence *= 0.60
+        }
+        let highBitrateLike = ["192 kbps", "224 kbps", "256 kbps", "320 kbps"].contains(classification.label)
         if highBitrateLike, evidenceConfidence < 0.30 {
             confidence *= 0.60
         }
@@ -1260,12 +1395,12 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
         confidence = max(0, min(1, confidence))
 
         return BitrateEstimate(
-            cutoffHz: cutoffHz,
+            cutoffHz: fusedCutoffHz,
             nyquistHz: nyquistHz,
             inferredBitrate: classification.label,
-            dropScore: dropScore,
+            dropScore: shelfSharpness,
             stability: stability,
-            suppressionScore: suppressionScore,
+            suppressionScore: highBandSuppression,
             sampleSupport: sampleSupport,
             evidenceConfidence: evidenceConfidence,
             classificationConfidence: classification.score,
@@ -1274,40 +1409,153 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
         )
     }
 
-    private static func estimateCutoffIndex(from spectrum: [Float], thresholdDrop: Float) -> Int {
-        guard spectrum.count > 10, let peak = spectrum.max() else { return 0 }
+    // MARK: - Cutoff Detection Methods
 
-        // Primary estimate: last bin still within thresholdDrop of the spectrum peak.
-        let threshold = peak - thresholdDrop
-        let primary = spectrum.lastIndex(where: { $0 >= threshold }) ?? 0
-
-        // Gradient refinement: within a ±12.5% search window around the primary estimate,
-        // look for the bin with the steepest local drop. This finds the true "knee" of the
-        // spectral shelf rather than the first point that crosses the flat threshold.
-        let window = max(2, spectrum.count / 50)   // ~2% of spectrum width per gradient step
-        let searchLo = max(0, primary - spectrum.count / 8)
-        let searchHi = min(spectrum.count - window - 1, primary + spectrum.count / 20)
-
+    /// Method A: Gradient — find frequency with steepest spectral descent
+    private static func cutoffGradient(spectrum: [Float], frequencyResolution: Double) -> Double {
+        let count = spectrum.count
+        guard count > 20 else { return 0 }
+        let step = max(4, count / 200)
         var steepestDrop: Float = 0
-        var kneeIndex = primary
+        var kneeIndex = 0
 
-        for i in searchLo...max(searchLo, searchHi) {
-            let drop = spectrum[i] - spectrum[min(i + window, spectrum.count - 1)]
+        // Search from 5% to 95% of spectrum to avoid edges
+        let searchLo = max(1, count / 20)
+        let searchHi = min(count - step - 1, count * 19 / 20)
+
+        for i in searchLo..<searchHi {
+            let drop = spectrum[i] - spectrum[min(i + step, count - 1)]
             if drop > steepestDrop {
                 steepestDrop = drop
                 kneeIndex = i
             }
         }
 
-        // Only use the gradient-derived knee when the drop is clearly sharper than noise.
-        // A shelf edge from MP3 low-pass filtering will be at least 0.5× thresholdDrop deep
-        // over the gradient window; gradual frequency roll-off will not.
-        if steepestDrop >= thresholdDrop * 0.5 {
-            return kneeIndex
+        // Require a meaningful drop (at least 3 dB over the step) to declare a cutoff
+        if steepestDrop < 3.0 {
+            return Double(count - 1) * frequencyResolution  // No clear cutoff → near Nyquist
+        }
+        return Double(kneeIndex) * frequencyResolution
+    }
+
+    /// Method B: Cumulative energy ratio — find frequency containing 99.5% of total energy
+    private static func cutoffEnergyRatio(powerSpectrum: [Float], frequencyResolution: Double) -> Double {
+        let count = powerSpectrum.count
+        guard count > 0 else { return 0 }
+
+        var cumulative = [Double](repeating: 0, count: count)
+        cumulative[0] = Double(powerSpectrum[0])
+        for i in 1..<count {
+            cumulative[i] = cumulative[i - 1] + Double(powerSpectrum[i])
         }
 
-        return primary
+        let totalEnergy = cumulative[count - 1]
+        guard totalEnergy > 0 else { return 0 }
+        let threshold = totalEnergy * 0.995
+
+        for i in 0..<count where cumulative[i] >= threshold {
+            return Double(i) * frequencyResolution
+        }
+        return Double(count - 1) * frequencyResolution
     }
+
+    /// Method C: Noise floor — scan from top down, find first band above noise floor + margin
+    private static func cutoffNoiseFloor(spectrumDb: [Float], frequencyResolution: Double, nyquistHz: Double) -> Double {
+        let count = spectrumDb.count
+        guard count > 20 else { return 0 }
+
+        // Estimate noise floor from the top 5% of frequency bins
+        let noiseStart = count * 95 / 100
+        let noiseSlice = Array(spectrumDb[noiseStart..<count])
+        let noiseFloor = noiseSlice.reduce(0, +) / Float(max(noiseSlice.count, 1))
+
+        let margin: Float = 10.0  // dB above noise floor
+        let bandWidth = max(4, count / 50)  // ~500 Hz bands at typical resolution
+
+        // Scan from high frequency downward
+        var bandStart = count - bandWidth
+        while bandStart > 0 {
+            let bandEnd = min(count, bandStart + bandWidth)
+            let bandSlice = Array(spectrumDb[bandStart..<bandEnd])
+            let bandMean = bandSlice.reduce(0, +) / Float(bandSlice.count)
+            if bandMean > noiseFloor + margin {
+                return Double(bandEnd) * frequencyResolution
+            }
+            bandStart -= bandWidth
+        }
+
+        return 0  // All below noise floor (shouldn't happen for real audio)
+    }
+
+    /// Compute shelf sharpness: normalized dB drop across the cutoff region
+    private static func computeShelfSharpness(spectrum: [Float], cutoffIndex: Int) -> Double {
+        let count = spectrum.count
+        guard count > 20, cutoffIndex > 0, cutoffIndex < count - 1 else { return 0 }
+
+        let width = max(4, count / 100)
+        let preStart = max(0, cutoffIndex - width)
+        let preEnd = cutoffIndex
+        let postStart = min(count - 1, cutoffIndex + 2)
+        let postEnd = min(count, postStart + width)
+
+        guard preEnd > preStart, postEnd > postStart else { return 0 }
+
+        let preMean = Array(spectrum[preStart..<preEnd]).reduce(0, +) / Float(preEnd - preStart)
+        let postMean = Array(spectrum[postStart..<postEnd]).reduce(0, +) / Float(postEnd - postStart)
+        let drop = Double(max(0, preMean - postMean))
+
+        // Normalize: 0 dB drop → 0, ≥20 dB drop → 1
+        return normalized(value: drop, minValue: 0, maxValue: 20)
+    }
+
+    // MARK: - Sub-Band Analysis
+
+    private struct SubBandResult {
+        let highBandEnergyRatio: Double
+        let airBandFlatness: Double
+    }
+
+    private static func subBandAnalysis(powerSpectrum: [Float], sampleRate: Int, freqBins: Int) -> SubBandResult {
+        let nyquist = Double(sampleRate) / 2.0
+        let binHz = nyquist / Double(freqBins)
+
+        // 8 sub-bands (Hz boundaries at 44.1 kHz)
+        let bandEdges: [(lo: Double, hi: Double)] = [
+            (20, 200), (200, 500), (500, 1500), (1500, 4000),
+            (4000, 8000), (8000, 12000), (12000, 16000), (16000, nyquist)
+        ]
+
+        var bandEnergies = [Double](repeating: 0, count: bandEdges.count)
+        for (idx, band) in bandEdges.enumerated() {
+            let loIdx = max(0, Int((band.lo / binHz).rounded()))
+            let hiIdx = min(freqBins - 1, Int((band.hi / binHz).rounded()))
+            guard hiIdx > loIdx else { continue }
+            for i in loIdx...hiIdx {
+                bandEnergies[idx] += Double(powerSpectrum[i])
+            }
+        }
+
+        // High-band energy ratio: bands 7+8 vs bands 1-6
+        let lowEnergy = bandEnergies[0..<6].reduce(0, +)
+        let highEnergy = bandEnergies[6..<8].reduce(0, +)
+        let highBandEnergyRatio = lowEnergy > 1e-12 ? highEnergy / lowEnergy : 0
+
+        // Spectral flatness of air band (band 8): geometric mean / arithmetic mean
+        let airLo = max(0, Int((16000.0 / binHz).rounded()))
+        let airHi = min(freqBins - 1, freqBins - 1)
+        var airBandFlatness = 0.0
+        if airHi > airLo {
+            let airSlice = Array(powerSpectrum[airLo...airHi]).map { Double(max($0, 1e-24)) }
+            let logSum = airSlice.reduce(0.0) { $0 + log($1) }
+            let geometricMean = exp(logSum / Double(airSlice.count))
+            let arithmeticMean = airSlice.reduce(0, +) / Double(airSlice.count)
+            airBandFlatness = arithmeticMean > 1e-24 ? geometricMean / arithmeticMean : 0
+        }
+
+        return SubBandResult(highBandEnergyRatio: highBandEnergyRatio, airBandFlatness: airBandFlatness)
+    }
+
+    // MARK: - Utility Functions
 
     private static func stabilityScore(_ values: [Double]) -> Double {
         guard values.count > 1 else { return 0.5 }
@@ -1357,7 +1605,7 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
     }
 
     private static func samplesPerWindow(_ sampleRate: Int) -> Int {
-        sampleRate
+        analysisFFTLength
     }
 
     private static func largestPowerOfTwo(atMost value: Int) -> Int {
@@ -1389,104 +1637,83 @@ private nonisolated enum CodecProfile {
     case lossless
     case generic
 
-    var thresholdDropDB: Float {
-        switch self {
-        case .mp3: return 1.55
-        case .aac: return 1.40
-        case .opus: return 1.25
-        case .lossless: return 1.55  // Match MP3 sensitivity to detect upconverted content in lossless containers
-        case .generic: return 1.50
-        }
-    }
+    /// Hz-precision bitrate buckets at 44100 Hz reference sample rate.
+    /// Each tuple: (lowHz, highHz, centerHz, label)
+    private typealias Bucket = (lo: Double, hi: Double, center: Double, label: String)
 
-    func classification(for cutoffKHz: Int, cutoffRatio: Double) -> (label: String, score: Double) {
-        if self == .lossless {
-            // If the spectrum extends close to Nyquist the content is genuinely lossless.
-            // If there is a premature cutoff it is likely upconverted from a lossy source —
-            // use the same bucket mapping as MP3 since that is by far the most common source.
-            if cutoffRatio >= 0.92 {
-                let score = normalizedScore(cutoffRatio, center: 0.97, spread: 0.05)
-                return ("lossless", score)
-            }
-            return classify(
-                cutoffKHz: cutoffKHz,
-                buckets: [
-                    (0...11, "64 kbps", 10),
-                    (12...14, "128 kbps", 13),
-                    (15...16, "160 kbps", 15),
-                    (17...18, "192 kbps", 17),
-                    (19...19, "224 kbps", 19),
-                    (20...21, "320 kbps", 20)
-                ]
-            )
-        }
-
+    private var referenceBuckets: [Bucket] {
         switch self {
-        case .mp3:
-            return classify(
-                cutoffKHz: cutoffKHz,
-                buckets: [
-                    (0...11, "64 kbps", 10),
-                    (12...14, "128 kbps", 13),
-                    (15...16, "160 kbps", 15),
-                    (17...18, "192 kbps", 17),
-                    (19...19, "224 kbps", 19),
-                    (20...21, "320 kbps", 20)
-                ]
-            )
+        case .mp3, .lossless, .generic:
+            return [
+                (3500,  4500,  4000,  "32 kbps"),
+                (10500, 11500, 11000, "64 kbps"),
+                (13500, 14500, 14000, "96 kbps"),
+                (15500, 16500, 16000, "128 kbps"),
+                (17000, 18000, 17500, "160 kbps"),
+                (18500, 19500, 19000, "192 kbps"),
+                (19200, 19800, 19500, "224 kbps"),
+                (19800, 20200, 20000, "256 kbps"),
+                (20000, 20500, 20250, "320 kbps"),
+            ]
         case .aac:
-            return classify(
-                cutoffKHz: cutoffKHz,
-                buckets: [
-                    (0...13, "96 kbps", 12),
-                    (14...17, "128 kbps", 16),
-                    (18...20, "192 kbps", 19),
-                    (21...22, "256 kbps", 21)
-                ]
-            )
+            return [
+                (12500, 13500, 13000, "64 kbps"),
+                (14500, 15500, 15000, "96 kbps"),
+                (15500, 17000, 16000, "128 kbps"),
+                (17000, 18000, 17500, "160 kbps"),
+                (18500, 19500, 19000, "192 kbps"),
+                (19800, 20500, 20000, "256 kbps"),
+            ]
         case .opus:
-            return classify(
-                cutoffKHz: cutoffKHz,
-                buckets: [
-                    (0...11, "96 kbps", 10),
-                    (12...16, "128 kbps", 15),
-                    (17...20, "192 kbps", 18)
-                ]
-            )
-        case .lossless:
-            // Handled above; unreachable but satisfies exhaustiveness.
-            return ("lossless", 0.98)
-        case .generic:
-            return classify(
-                cutoffKHz: cutoffKHz,
-                buckets: [
-                    (0...11, "64 kbps", 10),
-                    (12...14, "128 kbps", 13),
-                    (15...16, "160 kbps", 15),
-                    (17...18, "192 kbps", 17),
-                    (19...19, "224 kbps", 19),
-                    (20...20, "320 kbps", 20),
-                    (21...22, "500 kbps", 21)
-                ]
-            )
+            return [
+                (10000, 12000, 11000, "64 kbps"),
+                (12000, 14000, 13000, "96 kbps"),
+                (14000, 17000, 15500, "128 kbps"),
+                (17000, 19000, 18000, "160 kbps"),
+                (19000, 20500, 19500, "192 kbps"),
+            ]
         }
     }
 
-    private func classify(
-        cutoffKHz: Int,
-        buckets: [(ClosedRange<Int>, String, Int)]
-    ) -> (label: String, score: Double) {
-        for (range, label, center) in buckets where range.contains(cutoffKHz) {
-            let width = max(1, (range.upperBound - range.lowerBound + 1))
-            let spread = Double(width) * 0.55
-            let score = normalizedScore(Double(cutoffKHz), center: Double(center), spread: spread)
-            return (label, score)
+    /// Classify a cutoff frequency (in Hz) to a bitrate label using Hz-precision thresholds.
+    /// Thresholds are scaled proportionally for non-44100 Hz sample rates.
+    func classifyContinuous(cutoffHz: Double, sampleRate: Int) -> (label: String, score: Double) {
+        let scale = Double(sampleRate) / 44100.0
+        let buckets = referenceBuckets
+        var bestLabel = "unknown"
+        var bestScore = 0.35
+
+        for bucket in buckets {
+            let lo = bucket.lo * scale
+            let hi = bucket.hi * scale
+            let center = bucket.center * scale
+
+            if cutoffHz >= lo && cutoffHz <= hi {
+                let spread = (hi - lo) * 0.55
+                let score = gaussianScore(cutoffHz, center: center, spread: spread)
+                if score > bestScore {
+                    bestScore = score
+                    bestLabel = bucket.label
+                }
+            } else {
+                // Allow near-misses with reduced score
+                let distance = cutoffHz < lo ? lo - cutoffHz : cutoffHz - hi
+                let spread = (hi - lo) * 0.55
+                if distance < spread * 2 {
+                    let score = gaussianScore(cutoffHz, center: center, spread: spread) * 0.8
+                    if score > bestScore {
+                        bestScore = score
+                        bestLabel = bucket.label
+                    }
+                }
+            }
         }
-        return ("unknown", 0.35)
+
+        return (bestLabel, bestScore)
     }
 
-    private func normalizedScore(_ value: Double, center: Double, spread: Double) -> Double {
-        guard spread > 0 else { return 0.0 }
+    private func gaussianScore(_ value: Double, center: Double, spread: Double) -> Double {
+        guard spread > 0 else { return 0 }
         let distance = abs(value - center)
         let score = exp(-distance / spread)
         return max(0.30, min(0.99, score))

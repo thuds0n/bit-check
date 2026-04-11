@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		9E3CBA342F627478000F4CFB /* BITRATE_CALCULATION.md in Resources */ = {isa = PBXBuildFile; fileRef = 9E3CBA2E2F627478000F4CFB /* BITRATE_CALCULATION.md */; };
+		9E3CBA342F627478000F4CFB /* CALCULATIONS.md in Resources */ = {isa = PBXBuildFile; fileRef = 9E3CBA2E2F627478000F4CFB /* CALCULATIONS.md */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -31,7 +31,7 @@
 		9E3CB9A42F6196E9000F4CFB /* BitCheck.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; path = BitCheck.xcodeproj; sourceTree = "<group>"; };
 		9E3CB9D02F619796000F4CFB /* AGENTS.md */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AGENTS.md; sourceTree = "<group>"; };
 		9E3CB9DB2F619ACF000F4CFB /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
-		9E3CBA2E2F627478000F4CFB /* BITRATE_CALCULATION.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = BITRATE_CALCULATION.md; sourceTree = "<group>"; };
+		9E3CBA2E2F627478000F4CFB /* CALCULATIONS.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = CALCULATIONS.md; sourceTree = "<group>"; };
 		9E3CBA472F627A2F000F4CFB /* PLAN.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = PLAN.md; sourceTree = "<group>"; };
 		9E4A38A42F52F9BB009F2151 /* BitCheck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BitCheck.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9E4A38B12F52F9BC009F2151 /* BitCheckTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BitCheckTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -97,7 +97,7 @@
 				9E4A38BE2F52F9BC009F2151 /* BitCheckUITests */,
 				9E4A38A52F52F9BB009F2151 /* Products */,
 				9E4A38DB2F52FBB2009F2151 /* README.md */,
-				9E3CBA2E2F627478000F4CFB /* BITRATE_CALCULATION.md */,
+				9E3CBA2E2F627478000F4CFB /* CALCULATIONS.md */,
 				9E3CB9D02F619796000F4CFB /* AGENTS.md */,
 				9E3CB9DB2F619ACF000F4CFB /* .gitignore */,
 				9E3CBA472F627A2F000F4CFB /* PLAN.md */,
@@ -240,7 +240,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				9E3CBA342F627478000F4CFB /* BITRATE_CALCULATION.md in Resources */,
+				9E3CBA342F627478000F4CFB /* CALCULATIONS.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
