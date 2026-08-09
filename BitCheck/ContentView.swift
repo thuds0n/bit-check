@@ -980,6 +980,12 @@ final class ValidationViewModel: ObservableObject {
             "is_trainable",
             "is_match",
             "cutoff_khz",
+            "gradient_cutoff_khz",
+            "energy_cutoff_khz",
+            "noise_floor_cutoff_khz",
+            "cutoff_spread_khz",
+            "cutoff_mean_deviation_khz",
+            "cutoff_agreement",
             "cutoff_ratio",
             "drop_score",
             "stability",
@@ -1006,6 +1012,12 @@ final class ValidationViewModel: ObservableObject {
             row.append(sample.isTrainable ? "true" : "false")
             row.append(sample.isMatch.map { $0 ? "true" : "false" } ?? "")
             row.append(features?.cutoffKHzText ?? "")
+            row.append(features?.gradientCutoffKHzText ?? "")
+            row.append(features?.energyCutoffKHzText ?? "")
+            row.append(features?.noiseFloorCutoffKHzText ?? "")
+            row.append(features?.cutoffSpreadKHzText ?? "")
+            row.append(features?.cutoffMeanDeviationKHzText ?? "")
+            row.append(features?.cutoffAgreementText ?? "")
             row.append(features?.cutoffRatioText ?? "")
             row.append(features?.dropScoreText ?? "")
             row.append(features?.stabilityText ?? "")
@@ -1062,7 +1074,8 @@ nonisolated enum NativeTrueBitrateAnalyzer {
                     reportedBitrate: samples.reportedBitrate,
                     bitrateMode: samples.bitrateMode,
                     features: nil,
-                    cutoffHz: nil
+                    cutoffHz: nil,
+                    verdict: nil
                 )
             }
 
@@ -1076,7 +1089,8 @@ nonisolated enum NativeTrueBitrateAnalyzer {
                 reportedBitrate: samples.reportedBitrate,
                 bitrateMode: samples.bitrateMode,
                 features: estimate.features,
-                cutoffHz: estimate.cutoffHz
+                cutoffHz: estimate.cutoffHz,
+                verdict: estimate.verdict
             )
         } catch {
             return RunResult(
@@ -1088,7 +1102,8 @@ nonisolated enum NativeTrueBitrateAnalyzer {
                 reportedBitrate: "N/A",
                 bitrateMode: "Unknown",
                 features: nil,
-                cutoffHz: nil
+                cutoffHz: nil,
+                verdict: nil
             )
         }
     }
@@ -1359,15 +1374,14 @@ nonisolated enum NativeTrueBitrateAnalyzer {
         let smoothed = movingAverage(spectrumDb, window: max(3, freqBins / 80))
 
         // --- Multi-method cutoff detection ---
-        let cutoffA = cutoffGradient(spectrum: smoothed, frequencyResolution: frequencyResolution)
-        let cutoffB = cutoffEnergyRatio(powerSpectrum: averagedPower, frequencyResolution: frequencyResolution)
-        let cutoffC = cutoffNoiseFloor(spectrumDb: smoothed, frequencyResolution: frequencyResolution, nyquistHz: nyquistHz)
-
-        // Fused cutoff = median of three methods
-        let sortedCutoffs = [cutoffA, cutoffB, cutoffC].sorted()
-        let fusedCutoffHz = sortedCutoffs[1]
-        let cutoffSpread = sortedCutoffs[2] - sortedCutoffs[0]
-        let cutoffAgreement = 1.0 - normalized(value: cutoffSpread, minValue: 0, maxValue: 2000)
+        let cutoffEvidence = cutoffEvidence(
+            powerSpectrum: averagedPower,
+            spectrumDb: smoothed,
+            frequencyResolution: frequencyResolution,
+            nyquistHz: nyquistHz
+        )
+        let fusedCutoffHz = cutoffEvidence.fusedHz
+        let cutoffAgreement = cutoffEvidence.agreement
         let cutoffRatio = fusedCutoffHz / nyquistHz
 
         // Shelf sharpness: dB drop across the cutoff region
@@ -1417,23 +1431,36 @@ nonisolated enum NativeTrueBitrateAnalyzer {
             + 0.05 * normalized(value: shelfSharpness, minValue: 0.0, maxValue: 1.0)
         ))
 
-        var confidence = 0.65 * evidenceConfidence + 0.35 * classification.score
-        // Penalties
-        if shelfSharpness < 0.05, stability < 0.10 {
-            confidence *= 0.45
-        }
-        if highBandSuppression < 0.20 {
-            confidence *= 0.75
-        }
-        if cutoffAgreement < 0.30 {
-            confidence *= 0.60
-        }
-        let highBitrateLike = ["192 kbps", "224 kbps", "256 kbps", "320 kbps"].contains(classification.label)
-        if highBitrateLike, evidenceConfidence < 0.30 {
-            confidence *= 0.60
-        }
-        if cutoffRatio > 0.995 {
-            confidence *= 0.90
+        var confidence: Double
+        if classification.label == "lossless" {
+            let bandwidthSupport = normalized(value: cutoffRatio, minValue: 0.92, maxValue: 1.0)
+            let highBandPresence = 1.0 - highBandSuppression
+            confidence =
+                0.55 * classification.score
+                + 0.25 * bandwidthSupport
+                + 0.10 * highBandPresence
+                + 0.10 * sampleSupport
+            if cutoffRatio > 0.995 {
+                confidence *= 0.95
+            }
+        } else {
+            confidence = 0.65 * evidenceConfidence + 0.35 * classification.score
+            if shelfSharpness < 0.05, stability < 0.10 {
+                confidence *= 0.45
+            }
+            if highBandSuppression < 0.20 {
+                confidence *= 0.75
+            }
+            if cutoffAgreement < 0.30 {
+                confidence *= 0.60
+            }
+            let highBitrateLike = ["192 kbps", "224 kbps", "256 kbps", "320 kbps"].contains(classification.label)
+            if highBitrateLike, evidenceConfidence < 0.30 {
+                confidence *= 0.60
+            }
+            if cutoffRatio > 0.995 {
+                confidence *= 0.90
+            }
         }
         confidence = max(0, min(1, confidence))
 
@@ -1448,7 +1475,8 @@ nonisolated enum NativeTrueBitrateAnalyzer {
             evidenceConfidence: evidenceConfidence,
             classificationConfidence: classification.score,
             confidence: confidence,
-            isLosslessContainer: profile == .lossless
+            isLosslessContainer: profile == .lossless,
+            cutoffEvidence: cutoffEvidence
         )
     }
 
@@ -1472,6 +1500,36 @@ nonisolated enum NativeTrueBitrateAnalyzer {
     }
 
     // MARK: - Cutoff Detection Methods
+
+    static func cutoffEvidence(
+        powerSpectrum: [Float],
+        spectrumDb: [Float],
+        frequencyResolution: Double,
+        nyquistHz: Double
+    ) -> CutoffEvidence {
+        let gradientHz = cutoffGradient(spectrum: spectrumDb, frequencyResolution: frequencyResolution)
+        let energyHz = cutoffEnergyRatio(powerSpectrum: powerSpectrum, frequencyResolution: frequencyResolution)
+        let noiseFloorHz = cutoffNoiseFloor(
+            spectrumDb: spectrumDb,
+            frequencyResolution: frequencyResolution,
+            nyquistHz: nyquistHz
+        )
+        let sortedCutoffs = [gradientHz, energyHz, noiseFloorHz].sorted()
+        let fusedHz = sortedCutoffs[1]
+        let spreadHz = sortedCutoffs[2] - sortedCutoffs[0]
+        let meanDeviationHz = [gradientHz, energyHz, noiseFloorHz]
+            .map { abs($0 - fusedHz) }
+            .reduce(0, +) / 3.0
+        return CutoffEvidence(
+            gradientHz: gradientHz,
+            energyHz: energyHz,
+            noiseFloorHz: noiseFloorHz,
+            fusedHz: fusedHz,
+            spreadHz: spreadHz,
+            meanDeviationHz: meanDeviationHz,
+            agreement: 1.0 - normalized(value: meanDeviationHz, minValue: 0, maxValue: 2_000)
+        )
+    }
 
     /// Method A: Gradient — find frequency with steepest spectral descent
     private static func cutoffGradient(spectrum: [Float], frequencyResolution: Double) -> Double {
@@ -1546,7 +1604,9 @@ nonisolated enum NativeTrueBitrateAnalyzer {
             bandStart -= bandWidth
         }
 
-        return 0  // All below noise floor (shouldn't happen for real audio)
+        // No distinct shelf above the top-band reference: treat this as bandwidth
+        // extending to Nyquist, not as a 0 Hz cutoff outlier.
+        return min(nyquistHz, Double(count - 1) * frequencyResolution)
     }
 
     /// Compute shelf sharpness: normalized dB drop across the cutoff region
@@ -1686,6 +1746,16 @@ nonisolated struct AudioSamples {
     let reportedBitrate: String
     let bitrateMode: String
     let codecProfile: CodecProfile
+}
+
+nonisolated struct CutoffEvidence: Equatable {
+    let gradientHz: Double
+    let energyHz: Double
+    let noiseFloorHz: Double
+    let fusedHz: Double
+    let spreadHz: Double
+    let meanDeviationHz: Double
+    let agreement: Double
 }
 
 nonisolated struct FileMetadata {
@@ -1838,6 +1908,7 @@ nonisolated struct BitrateEstimate {
     /// True when the audio container is a lossless format (FLAC, WAV, AIFF, ALAC).
     /// When this is true and inferredBitrate is not "lossless", the file is a fake lossless.
     let isLosslessContainer: Bool
+    let cutoffEvidence: CutoffEvidence
 
     private var roundedCutoffKHz: Int {
         Int(cutoffHz / 1_000.0)
@@ -1852,11 +1923,10 @@ nonisolated struct BitrateEstimate {
     }
 
     private var confidencePercent: Int {
-        let finalConfidence = confidenceAdjustedForAmbiguity
         return Int((finalConfidence * 100).rounded())
     }
 
-    private var confidenceAdjustedForAmbiguity: Double {
+    var finalConfidence: Double {
         var adjusted = max(0, min(1, confidence))
         if inferredBitrate == "unknown" {
             adjusted = min(adjusted, 0.55)
@@ -1887,6 +1957,12 @@ nonisolated struct BitrateEstimate {
     var features: AnalysisFeatures {
         AnalysisFeatures(
             cutoffKHz: cutoffHz / 1_000.0,
+            gradientCutoffKHz: cutoffEvidence.gradientHz / 1_000.0,
+            energyCutoffKHz: cutoffEvidence.energyHz / 1_000.0,
+            noiseFloorCutoffKHz: cutoffEvidence.noiseFloorHz / 1_000.0,
+            cutoffSpreadKHz: cutoffEvidence.spreadHz / 1_000.0,
+            cutoffMeanDeviationKHz: cutoffEvidence.meanDeviationHz / 1_000.0,
+            cutoffAgreement: cutoffEvidence.agreement,
             cutoffRatio: cutoffRatio,
             dropScore: dropScore,
             stability: stability,
@@ -1895,31 +1971,52 @@ nonisolated struct BitrateEstimate {
             evidenceConfidence: evidenceConfidence,
             classificationConfidence: classificationConfidence,
             modelConfidence: confidence,
-            finalConfidence: confidenceAdjustedForAmbiguity
+            finalConfidence: finalConfidence
         )
     }
 
-    var status: String {
+    var verdict: AnalysisVerdict {
+        if !isLosslessContainer {
+            let estimatedSource = confidence >= 0.30 && inferredBitrate != "unknown" ? inferredBitrate : nil
+            return .lossyAsExpected(estimatedSource: estimatedSource)
+        }
         if confidence < 0.30 {
-            return "Inconclusive"
+            return .inconclusive(reason: nil)
         }
         if inferredBitrate == "lossless" {
-            // 0.92–0.95 is a borderline zone: the spectrum almost reaches Nyquist but not
-            // convincingly enough to call it clean lossless with high confidence.
             if cutoffRatio < 0.95 {
-                return "Possibly lossless (borderline)"
+                return .inconclusive(reason: "Possibly lossless (borderline)")
             }
+            return .likelyAuthentic
+        }
+        return .likelyTranscoded(estimatedSource: inferredBitrate)
+    }
+
+    var status: String {
+        verdict.label
+    }
+}
+
+nonisolated enum AnalysisVerdict: Equatable {
+    case likelyAuthentic
+    case likelyTranscoded(estimatedSource: String)
+    case lossyAsExpected(estimatedSource: String?)
+    case technicallyDefective(reason: String)
+    case inconclusive(reason: String?)
+
+    var label: String {
+        switch self {
+        case .likelyAuthentic:
             return "Likely lossless"
+        case .likelyTranscoded(let estimatedSource):
+            return "Fake lossless — upconverted from ~\(estimatedSource)"
+        case .lossyAsExpected(let estimatedSource):
+            return estimatedSource.map { "Likely lossy (\($0))" } ?? "Likely lossy"
+        case .technicallyDefective(let reason):
+            return "Technically defective — \(reason)"
+        case .inconclusive(let reason):
+            return reason ?? "Inconclusive"
         }
-        // Lossless container (FLAC/WAV/AIFF) with a premature spectral cutoff —
-        // the file was almost certainly transcoded from a lossy source.
-        if isLosslessContainer {
-            return "Fake lossless — upconverted from ~\(inferredBitrate)"
-        }
-        if inferredBitrate == "unknown" {
-            return "Likely lossy"
-        }
-        return "Likely lossy (\(inferredBitrate))"
     }
 }
 
@@ -1959,10 +2056,17 @@ nonisolated struct RunResult {
     let bitrateMode: String
     let features: AnalysisFeatures?
     let cutoffHz: Double?
+    let verdict: AnalysisVerdict?
 }
 
 nonisolated struct AnalysisFeatures {
     let cutoffKHz: Double
+    let gradientCutoffKHz: Double
+    let energyCutoffKHz: Double
+    let noiseFloorCutoffKHz: Double
+    let cutoffSpreadKHz: Double
+    let cutoffMeanDeviationKHz: Double
+    let cutoffAgreement: Double
     let cutoffRatio: Double
     let dropScore: Double
     let stability: Double
@@ -1974,6 +2078,12 @@ nonisolated struct AnalysisFeatures {
     let finalConfidence: Double
 
     var cutoffKHzText: String { Self.format(cutoffKHz) }
+    var gradientCutoffKHzText: String { Self.format(gradientCutoffKHz) }
+    var energyCutoffKHzText: String { Self.format(energyCutoffKHz) }
+    var noiseFloorCutoffKHzText: String { Self.format(noiseFloorCutoffKHz) }
+    var cutoffSpreadKHzText: String { Self.format(cutoffSpreadKHz) }
+    var cutoffMeanDeviationKHzText: String { Self.format(cutoffMeanDeviationKHz) }
+    var cutoffAgreementText: String { Self.format(cutoffAgreement) }
     var cutoffRatioText: String { Self.format(cutoffRatio) }
     var dropScoreText: String { Self.format(dropScore) }
     var stabilityText: String { Self.format(stability) }

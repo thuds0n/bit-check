@@ -158,6 +158,9 @@ scan from top downward in bands of bandWidth:
     if bandMean > noiseFloor + margin:
         cutoffC = bandEnd × frequencyResolution
         break
+
+if no band rises above the top-band reference:
+    cutoffC = frequency of the final bin   // no distinct shelf; bandwidth reaches Nyquist
 ```
 
 ### Fusion
@@ -167,11 +170,14 @@ sortedCutoffs = sort([cutoffA, cutoffB, cutoffC])
 fusedCutoffHz = sortedCutoffs[1]                            // median
 
 cutoffSpread     = sortedCutoffs[2] - sortedCutoffs[0]      // Hz
-cutoffAgreement  = 1 - normalized(cutoffSpread, 0, 2000)    // 0..1
+meanDeviation    = mean(abs(cutoff - fusedCutoffHz))         // robust around median
+cutoffAgreement  = 1 - normalized(meanDeviation, 0, 2000)   // 0..1
 cutoffRatio      = fusedCutoffHz / nyquistHz
 ```
 
-High `cutoffAgreement` (all three methods agree) is strong evidence for a well-defined spectral shelf.
+High `cutoffAgreement` is strong evidence for a well-defined spectral shelf. Agreement is centred on the median so one outlying method cannot erase agreement between the other two; full spread remains available as a diagnostic.
+
+The analyser retains `cutoffA`, `cutoffB`, `cutoffC`, the fused cutoff, spread, mean deviation, and agreement as `CutoffEvidence`. These values flow into `AnalysisFeatures` and the training CSV so disagreements can be examined during corpus calibration instead of being lost after fusion.
 
 ---
 
@@ -327,8 +333,19 @@ evidenceConfidence =
       + 0.05 × shelfSharpness     // double-weighted as primary discriminator
     )
 
-confidence = clamp(0.65 × evidenceConfidence + 0.35 × classificationScore)
+if classification == lossless:
+    bandwidthSupport = normalized(cutoffRatio, 0.92, 1.00)
+    highBandPresence  = 1 - highBandSuppression
+    confidence =
+        0.55 × classificationScore
+      + 0.25 × bandwidthSupport
+      + 0.10 × highBandPresence
+      + 0.10 × sampleSupport
+else:
+    confidence = clamp(0.65 × evidenceConfidence + 0.35 × classificationScore)
 ```
+
+Lossless confidence uses positive authenticity evidence. Penalising low shelf sharpness, unstable per-window cutoffs, or low high-band suppression would invert their meaning for a genuine full-band lossless signal.
 
 ### Post-Adjustment Penalties
 
@@ -347,6 +364,22 @@ confidence = clamp(0.65 × evidenceConfidence + 0.35 × classificationScore)
 | Label = "unknown" | 55% |
 | Label = "lossless" AND `cutoffRatio < 0.95` | 70% |
 | Fake lossless (lossless container, lossy content) | 85% |
+
+---
+
+## Verdict Classification
+
+The estimate is converted into an explicit `AnalysisVerdict` rather than relying on a display string as the result model:
+
+| Verdict | Current trigger |
+|---------|-----------------|
+| `likelyAuthentic` | Lossless profile, inferred lossless, cutoff ratio at least 0.95, and sufficient model confidence |
+| `likelyTranscoded` | Lossless profile with a lossy source-bitrate estimate |
+| `lossyAsExpected` | Known lossy profile; the source-bitrate estimate is omitted when model confidence is below 0.30 |
+| `inconclusive` | Raw model confidence below 0.30 or a borderline lossless result |
+| `technicallyDefective` | Reserved for decoded integrity and defect evidence introduced in a later analysis stage |
+
+The enum owns the current user-facing labels, while the underlying class and associated source estimate remain independently testable.
 
 ---
 
@@ -371,3 +404,5 @@ On the spectrogram, a fake lossless file shows a horizontal "wall" — a sharp, 
 - **Very short files**: Files under ~8 seconds yield fewer than 6 Welch segments, reducing stability and suppression evidence. Confidence is appropriately reduced via `sampleSupport`.
 - **High-sample-rate files**: Absolute source-bandwidth mapping avoids the previous proportional-scaling error, but encoder behaviour and genuinely ultrasonic content at uncommon sample rates have not yet been empirically validated.
 - **VBR MP3**: Variable bitrate files show per-segment cutoff variation. The stability penalty reduces confidence appropriately, but the inferred bitrate reflects the average rather than the minimum.
+- **Encoder-dependent bitrate tiers**: A runtime-generated Apple AAC encode labelled 128 kbps retained a cutoff around 18.7 kHz and currently maps to the provisional 192 kbps AAC bucket. Cutoff frequency alone is therefore insufficient for reliable source-bitrate claims across encoders.
+- **Native corpus coverage**: The deterministic runtime corpus currently covers AAC, ALAC, FLAC, and AAC-to-ALAC transcoding. The built-in MP3 and Opus encoder paths advertised by `afconvert` fail on the current host, so those codecs still require independently generated reference fixtures.

@@ -46,6 +46,9 @@ The work is deliberately staged. Repository accuracy, testability, correctness, 
 - Provisional weighted confidence and lossless discrimination models
 - Encoded codec inspection separated from filename container extension
 - Five-region sampling for long tracks and all-channel power-domain analysis
+- Per-method cutoff evidence retained through classification and training export
+- Explicit verdict classes for likely authentic, likely transcoded, lossy as expected, technically defective, and inconclusive results
+- Runtime-generated native AAC, ALAC, FLAC, and AAC-to-ALAC corpus cases derived from a known deterministic broadband source
 
 Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULATIONS.md`. They remain subject to corpus validation and replacement by codec-appropriate bandwidth models. The implementation treats these as absolute decoded bandwidths rather than scaling them with output sample rate.
 
@@ -59,9 +62,9 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 ### Verification status
 
 - The application builds successfully with the current Xcode toolchain.
-- The focused unit suite executes successfully: 6 tests covering the new foundation contracts.
-- The unit-test target now contains deterministic coverage for codec routing, absolute bandwidth mapping, independent training labels, distributed window selection, all-channel analysis, and stable result identity. The UI-test target remains template-only.
-- No committed labelled audio corpus currently validates thresholds, feature weights, confidence percentages, or false-positive rates.
+- The focused unit suite executes successfully: 12 tests covering the current foundation contracts and native codec corpus.
+- The unit-test target now contains deterministic coverage for codec routing, absolute bandwidth mapping, independent training labels, distributed window selection, all-channel analysis, cutoff fusion, generated PCM metadata, native AAC/ALAC/FLAC encoding and transcoding, verdicts, confidence caps, and stable result identity. The UI-test target remains template-only.
+- No held-out, multi-encoder labelled corpus currently validates thresholds, feature weights, confidence percentages, or false-positive rates. Runtime-generated fixtures provide regression evidence but are not a calibration set.
 - The current detector is therefore an implemented experimental baseline, not a calibrated final engine.
 
 ---
@@ -75,6 +78,7 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 - Heuristic scores are displayed as confidence percentages without empirical calibration.
 - Codec routing recognises the encoded stream independently from the container, but still groups codec families broadly and does not expose profiles such as AAC-LC versus HE-AAC.
 - Channel and window disagreement contributes to stability but is not yet preserved as explicit per-channel evidence.
+- A native Apple AAC file encoded at 128 kbps retains an approximately 18.7 kHz cutoff and currently maps to the provisional 192 kbps AAC bucket, demonstrating that cutoff-only bitrate tiers are not encoder-independent.
 
 ### Performance and resilience
 
@@ -108,10 +112,11 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 
 - [x] Expose narrow testable analysis seams without moving signal work onto the main actor
 - [x] Replace the template unit test with deterministic coverage for codec routing, mapping, labels, sampling, all-channel analysis, and result identity
-- [ ] Add focused cutoff-fusion, metadata extraction, confidence, and verdict tests
-- [ ] Build generated fixtures across MP3, AAC-LC, HE-AAC, Opus, FLAC, ALAC, WAV, and AIFF
+- [x] Add focused cutoff-fusion, metadata extraction, confidence, and verdict tests
+- [x] Add runtime-generated native AAC, ALAC, FLAC, and AAC-to-ALAC cases from a deterministic known source
+- [ ] Expand independently generated fixtures across MP3, AAC-LC, HE-AAC, Opus, WAV, AIFF, encoder modes, and additional lossless transcodes
 - [ ] Cover CBR, ABR, VBR, encoder-defined low-pass settings, mono/stereo, bit depth, and common sample rates
-- [ ] Create independently labelled genuine-lossless and transcode material from known sources
+- [x] Create initial independently labelled genuine-lossless and AAC-to-lossless transcode material from a deterministic known source
 - [ ] Keep training and evaluation sets separate
 - [ ] Record precision, recall, confusion matrices, and false-positive rates by codec and source class
 - [ ] Derive confidence calibration from held-out results rather than hand-selected percentages
@@ -123,9 +128,9 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 - [x] Replace proportional sample-rate scaling with provisional absolute bandwidth models
 - [x] Analyse every decoded channel in the power domain without phase cancellation
 - [x] Sample multiple regions across the complete track
-- [ ] Introduce explicit result classes such as likely authentic, likely transcoded, lossy as expected, technically defective, and inconclusive
+- [x] Introduce explicit result classes for likely authentic, likely transcoded, lossy as expected, technically defective, and inconclusive outcomes
 - [ ] Separate detected bandwidth from estimated source bitrate and source-codec hypotheses
-- [ ] Preserve per-method evidence so every result can explain its conclusion
+- [x] Preserve individual gradient, cumulative-energy, and noise-floor cutoffs plus spread and agreement
 - [x] Correct the training-label contract so only independent labels are trainable
 
 ### Stage 3 — Batch performance and spectrogram resilience
