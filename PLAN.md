@@ -1,122 +1,205 @@
-# BitCheck — Development Plan
+# Bit Check — Development Plan
 
-## What It Is
+## Product Direction
 
-**BitCheck** is a native macOS app that detects whether an audio file's claimed quality is genuine or upconverted from a lower-quality lossy source.
+Bit Check is a native macOS application for determining whether an audio file's claimed quality is credible, whether it has been transcoded or upconverted, and whether the file has technical defects that deserve review. The Xcode target and Swift module remain `BitCheck`.
 
-Detection is based entirely on native spectral signal analysis through pure signal physics.
+The long-term ambition is to deliver broad, advanced audio-quality analysis within a focused, polished Mac experience. Spectral cutoff detection remains an important signal, but it is not the final product boundary. Bit Check should combine spectral, codec, container, temporal, integrity, and signal-quality evidence to reach the strongest defensible result.
 
----
-
-## How Detection Works
-
-When audio is encoded with a lossy codec (MP3, AAC, Opus), the encoder applies a **low-pass filter** whose cutoff frequency is determined by the target bitrate. This spectral shelf is a permanent artefact baked into the decoded PCM — re-encoding at a higher bitrate or into a lossless container cannot restore the removed content.
-
-### Pipeline
-
-1. Open file natively with `AVAudioFile` (supports MP3, FLAC, WAV, AAC, AIFF, ALAC — no ffmpeg needed)
-2. For tracks > 60 s, seek to the 20% mark before reading to skip silent intros
-3. Read up to 30 seconds of mono Float32 PCM
-4. Apply **Welch's method**: 8192-sample Hann-windowed segments with 50% overlap
-5. For each segment: apply real FFT via vDSP, accumulate **squared magnitudes** (power spectrum)
-6. Average power spectrum across all segments; convert to dB: `10 × log₁₀(avgPower)`
-7. Smooth with a moving average (`window = max(3, freqBins / 80)`)
-8. Detect cutoff with **three independent methods**, fuse by median
-9. Map fused cutoff frequency → bitrate label using Hz-precision codec-specific thresholds
-
-### Lossless Container Logic
-
-This is the core detection path for **fake lossless** files (FLAC/WAV/AIFF upconverted from MP3).
-Unlike simple cutoff-ratio thresholding, detection now uses a **multi-feature lossless score**:
-
-```
-losslessScore =
-  0.25 × normalized(cutoffRatio, 0.90, 1.00)
-+ 0.20 × (1 − shelfSharpness)
-+ 0.20 × normalized(highBandEnergyRatio, 0.001, 0.02)
-+ 0.15 × normalized(airBandSpectralFlatness, 0.01, 0.50)
-+ 0.10 × (1 − cutoffAgreement)
-+ 0.10 × (1 − segmentStability)
-
-if losslessScore > 0.65  →  "lossless"
-else                     →  apply MP3 Hz-precision mapping → "Fake lossless — upconverted from ~X kbps"
-```
-
-### Cutoff → Bitrate Map (MP3, reference 44.1 kHz)
-
-| Cutoff range | Center | Bitrate |
-|-------------|--------|---------|
-| 3500–4500 Hz | 4000 Hz | 32 kbps |
-| 10500–11500 Hz | 11000 Hz | 64 kbps |
-| 13500–14500 Hz | 14000 Hz | 96 kbps |
-| 15500–16500 Hz | 16000 Hz | 128 kbps |
-| 17000–18000 Hz | 17500 Hz | 160 kbps |
-| 18500–19500 Hz | 19000 Hz | 192 kbps |
-| 19200–19800 Hz | 19500 Hz | 224 kbps |
-| 19800–20200 Hz | 20000 Hz | 256 kbps |
-| 20000–20500 Hz | 20250 Hz | 320 kbps |
-
-All thresholds scale: `threshold × (sampleRate / 44100)`.
-
-Full detail in `CALCULATIONS.md`.
+The work is deliberately staged. Repository accuracy, testability, correctness, performance, and core macOS interaction come before expanding the detector.
 
 ---
 
-## Current State
+## Product Principles
 
-### ✅ Done
-- Native macOS SwiftUI app (`BitCheck/ContentView.swift`)
-- AVFoundation audio decoding (no ffmpeg required)
-- FFT spectral analysis via Accelerate/vDSP
-- Spectrogram viewer with time/frequency axes (log and linear scale toggle)
-- Log/linear scale toggle on spectrogram (pre-renders both, instant switch)
-- Codec-specific cutoff thresholds (MP3, AAC, Opus, lossless containers)
-- **Fixed: fake lossless detection** — FLAC/WAV files now check spectrum instead of always returning "lossless"
-- **Fixed: intro-skip** — analysis seeks to 20% mark on long tracks
-- **Fixed: real FFT interleaving bug** — audio samples were being incorrectly treated as complex pairs; fixed by proper `withMemoryRebound` real-FFT packing in both the analyzer and spectrogram renderer
-- **Improved: Welch's method** — 8192-sample FFT, 50% overlapping windows, power spectrum (squared magnitude) averaging instead of linear magnitude averaging
-- **Improved: multi-method cutoff detection** — gradient, cumulative energy ratio, and noise floor methods fused by median; `cutoffAgreement` score measures inter-method consensus
-- **Improved: Hz-precision bitrate mapping** — continuous Hz thresholds replacing integer kHz buckets; all thresholds scale with sample rate
-- **Improved: sub-band energy analysis** — 8 logarithmically-spaced bands; high-band energy ratio and air-band spectral flatness computed
-- **Improved: multi-feature lossless discrimination** — replaces single `cutoffRatio ≥ 0.92` check with weighted 6-feature score
-- **Improved: confidence model** — incorporates shelf sharpness, cutoff agreement, spectral flatness; new penalty for low cutoff agreement
-- Confidence scoring (shelf sharpness, segment stability, high-band suppression, cutoff agreement, spectral flatness)
-- Training Mode with CSV export (for future native-labeled calibration)
-- Batch file/folder scanning with table UI
-- **Spectrogram cutoff overlay** — yellow horizontal line drawn at detected cutoff frequency with kHz label
-- **Borderline lossless status** — cutoffRatio 0.92–0.95 shows "Possibly lossless (borderline)"; confidence capped at 70%
-- **Spek-style spectrogram** — logarithmic frequency axis (20 Hz → Nyquist), Spek colour palette (black → purple → orange → yellow → white), 120 dB dynamic range, log-spaced y-axis labels
-- Dark background toggle for spectrogram (transparent silence pixels composite over black/white background)
-- dB legend with colour gradient and tick marks
-
-### 🔜 Next
-- **Calibration with known files** — test against a corpus of known-bitrate files to verify Hz-precision thresholds are well-centered; adjust bucket centers if systematic bias is found
-- **AAC/Opus threshold tuning** — the Hz-precision buckets for AAC and Opus were derived from published encoder documentation; real-world validation may require fine-tuning
-- **HE-AAC / SBR detection** — Spectral Band Replication synthesis creates artificial high-frequency energy that can fool energy-ratio methods; cross-correlation between low/high band envelopes would catch this
+- **Advanced, multi-signal analysis**: do not limit the product to a single spectral threshold or heuristic.
+- **Evidence-backed results**: expose the evidence behind a verdict and calibrate confidence against labelled material.
+- **Defensive classification**: retain an inconclusive state where evidence conflicts, without making that the limit of the product's ambition.
+- **Native Mac workflow**: fast drag and drop, keyboard support, clear batch results, restrained hierarchy, and useful Finder integration.
+- **Safe by default**: analysis is read-only. Any later rename, move, or delete capability must be explicit and recoverable.
+- **Local processing**: keep audio analysis on-device with no external service or package dependency.
+- **Scalable batches**: library-sized imports must remain responsive, cancellable, and memory-bounded.
 
 ---
 
-## Repo Structure
+## Current Implemented Baseline
 
-```
-BitCheck.xcodeproj/       Xcode project (open this)
+### Application
+
+- Native SwiftUI macOS application with App Sandbox enabled
+- File and folder selection plus drag-and-drop import
+- Recursive discovery of supported audio files
+- Native toolbar and decision-focused sortable batch-results table
+- Finder reveal action
+- Training CSV export
+- Separate spectrogram windows keyed by file path
+
+### Analysis
+
+- Native decoding through `AVAudioFile`
+- `Accelerate`/vDSP real FFT processing
+- 8192-sample Hann windows with 50% overlap
+- Power-spectrum averaging based on Welch's method
+- Gradient, cumulative-energy, and noise-floor cutoff estimates fused by median
+- Shelf sharpness, segment stability, high-band energy, spectral flatness, and method-agreement features
+- Provisional codec-specific cutoff-to-bitrate mappings
+- Provisional weighted confidence and lossless discrimination models
+- Encoded codec inspection separated from filename container extension
+- Five-region sampling for long tracks and all-channel power-domain analysis
+
+Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULATIONS.md`. They remain subject to corpus validation and replacement by codec-appropriate bandwidth models. The implementation treats these as absolute decoded bandwidths rather than scaling them with output sample rate.
+
+### Spectrogram
+
+- Logarithmic and linear frequency views
+- Spek-inspired colour scale and dB legend
+- Detected-cutoff overlay
+- Optional grid and dark background
+
+### Verification status
+
+- The application builds successfully with the current Xcode toolchain.
+- The focused unit suite executes successfully: 6 tests covering the new foundation contracts.
+- The unit-test target now contains deterministic coverage for codec routing, absolute bandwidth mapping, independent training labels, distributed window selection, all-channel analysis, and stable result identity. The UI-test target remains template-only.
+- No committed labelled audio corpus currently validates thresholds, feature weights, confidence percentages, or false-positive rates.
+- The current detector is therefore an implemented experimental baseline, not a calibrated final engine.
+
+---
+
+## Known Issues to Resolve
+
+### Correctness
+
+- Lossless-container failures are mapped through MP3 bitrate buckets even when the earlier codec is unknown.
+- Reported bitrate, encoded bitrate, PCM data rate, bit depth, sample rate, channel layout, and duration are not yet represented as distinct concepts throughout the result model.
+- Heuristic scores are displayed as confidence percentages without empirical calibration.
+- Codec routing recognises the encoded stream independently from the container, but still groups codec families broadly and does not expose profiles such as AAC-LC versus HE-AAC.
+- Channel and window disagreement contributes to stability but is not yet preserved as explicit per-channel evidence.
+
+### Performance and resilience
+
+- Folder discovery and metadata inspection can block the main actor.
+- Batch analysis is sequential and has no cancellation path.
+- Result arrays are repeatedly replaced during a run, although file-based result identity is now stable.
+- Spectrogram rendering reads the complete file and creates two duration-proportional images, causing unbounded memory growth.
+- File corruption detection is limited to whether native decoding throws an error.
+
+### Product and project consistency
+
+- The app icon set has no artwork.
+- The table has been simplified, but a proper result inspector and adaptive batch summary are still missing.
+
+---
+
+## Staged Roadmap
+
+### Stage 0 — Repository and product cleanup
+
+- [x] Present the product as **Bit Check** while retaining `BitCheck` for the target, module, bundle identifier, and source symbols
+- [x] Set and document macOS 14 as the compatibility floor
+- [x] Remove stale legacy-script references from public documentation
+- [x] Stop bundling development-only Markdown as an application resource
+- [x] Remove the apparent self-reference from the Xcode project
+- [ ] Add complete application icon artwork
+- [x] Give results stable file-based identity
+- [x] Align `README.md`, `PLAN.md`, and `CALCULATIONS.md` with what is actually implemented
+
+### Stage 1 — Validation infrastructure
+
+- [x] Expose narrow testable analysis seams without moving signal work onto the main actor
+- [x] Replace the template unit test with deterministic coverage for codec routing, mapping, labels, sampling, all-channel analysis, and result identity
+- [ ] Add focused cutoff-fusion, metadata extraction, confidence, and verdict tests
+- [ ] Build generated fixtures across MP3, AAC-LC, HE-AAC, Opus, FLAC, ALAC, WAV, and AIFF
+- [ ] Cover CBR, ABR, VBR, encoder-defined low-pass settings, mono/stereo, bit depth, and common sample rates
+- [ ] Create independently labelled genuine-lossless and transcode material from known sources
+- [ ] Keep training and evaluation sets separate
+- [ ] Record precision, recall, confusion matrices, and false-positive rates by codec and source class
+- [ ] Derive confidence calibration from held-out results rather than hand-selected percentages
+
+### Stage 2 — Correct analysis foundations
+
+- [x] Identify codec and container separately using stream metadata rather than extensions
+- [ ] Represent claimed bitrate, average encoded bitrate, PCM data rate, sample rate, bit depth, channels, and duration explicitly
+- [x] Replace proportional sample-rate scaling with provisional absolute bandwidth models
+- [x] Analyse every decoded channel in the power domain without phase cancellation
+- [x] Sample multiple regions across the complete track
+- [ ] Introduce explicit result classes such as likely authentic, likely transcoded, lossy as expected, technically defective, and inconclusive
+- [ ] Separate detected bandwidth from estimated source bitrate and source-codec hypotheses
+- [ ] Preserve per-method evidence so every result can explain its conclusion
+- [x] Correct the training-label contract so only independent labels are trainable
+
+### Stage 3 — Batch performance and spectrogram resilience
+
+- [ ] Move file discovery and metadata reads off the main actor
+- [ ] Add bounded task-group concurrency appropriate to Apple silicon
+- [ ] Add progress, cancellation, and per-file failure isolation
+- [ ] Update individual results without replacing stable collection identity
+- [ ] Bound spectrogram width and aggregate FFT frames into display columns
+- [ ] Avoid retaining duplicate full-resolution intensity and pixel buffers
+- [ ] Benchmark large folders, long recordings, and high-sample-rate material
+
+### Stage 4 — Native macOS workflow
+
+- [x] Move Add Files, Add Folder, Clear, and Run into a native toolbar; cancellation remains pending
+- [x] Move training controls into a secondary toolbar menu
+- [x] Simplify the main table to the most decision-relevant columns
+- [ ] Add a detail inspector for codec metadata, evidence, confidence, and spectrogram access
+- [ ] Add verdict filters and a compact batch summary
+- [ ] Add File and View menu commands with keyboard shortcuts
+- [ ] Support double-click and Space for fast inspection
+- [ ] Add accessible non-colour verdict labels and accessible spectrogram summaries
+- [ ] Preserve a read-only workflow while considering later Finder tags and export actions
+
+### Stage 5 — Advanced multi-signal detection
+
+- [ ] Detect HE-AAC/SBR and other bandwidth-extension patterns
+- [ ] Detect resampling and sample-rate upconversion evidence
+- [ ] Model encoder- and mode-specific artefacts beyond a single cutoff frequency
+- [ ] Add temporal cutoff and bandwidth-distribution analysis across complete tracks
+- [ ] Detect clipping and sustained inter-sample peak risk where practical
+- [ ] Validate declared duration against decoded frame duration
+- [ ] Detect truncated, malformed, unreadable, and internally inconsistent streams
+- [ ] Investigate codec residue, quantisation-noise, low-pass shape, pre-echo, and spectral-texture features
+- [ ] Combine independent feature families through a calibrated classifier when the corpus supports it
+- [ ] Add optional playback with navigation to suspicious regions
+- [ ] Expand format support where native macOS decoding permits reliable analysis
+- [ ] Evaluate explicit rename, move, copy, Finder-tag, and delete workflows only after safe result handling is mature
+
+---
+
+## Success Criteria
+
+Bit Check is ready to make strong automatic claims when:
+
+- labelled-corpus results demonstrate repeatable accuracy across codecs, modes, sample rates, and musical styles;
+- false-positive rates are documented and acceptable for the displayed verdict strength;
+- confidence values are calibrated against observed outcomes;
+- high-sample-rate, ALAC/M4A, multichannel, VBR, SBR, naturally bandwidth-limited, and historical recordings have dedicated coverage;
+- large batches remain responsive and cancellable;
+- spectrogram rendering remains memory-bounded for long files; and
+- users can understand why a file was flagged without reading implementation details.
+
+---
+
+## Repository Structure
+
+```text
+BitCheck.xcodeproj/       Xcode project
 BitCheck/
-  BitCheckApp.swift       @main entry point
-  ContentView.swift       entire app: UI, analysis engine, spectrogram renderer
+  BitCheckApp.swift       Application entry point
+  ContentView.swift       Interface, analysis engine, and spectrogram renderer
   Assets.xcassets/
-CALCULATIONS.md    algorithm specification (detailed maths)
-BitCheckTests/            unit test target (placeholder)
-BitCheckUITests/          UI test target (placeholder)
-true-bitrate              legacy bash CLI wrapper (uses ffmpeg + Python)
-true-bitrate.py           legacy Python spectral analysis script
+BitCheckTests/            Unit-test target with deterministic foundation coverage
+BitCheckUITests/          UI-test target; meaningful coverage pending
+README.md                 User-facing overview and usage
+CALCULATIONS.md           Current algorithm specification
+PLAN.md                   Product direction, current state, and roadmap
 ```
 
 ---
 
 ## Building
 
-Open `BitCheck.xcodeproj` in Xcode, select the **BitCheck** scheme, and run. macOS 14+ target. Zero external dependencies.
-
-```
-xcodebuild -scheme BitCheck -destination 'platform=macOS' build
+```bash
+xcodebuild -scheme BitCheck -destination 'platform=macOS' build | xcbeautify
 ```

@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct TrueBitrateMacApp: App {
+struct BitCheckApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()

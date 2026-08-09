@@ -27,11 +27,11 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("True Bitrate Validator")
+            Text("Bit Check")
                 .font(.largeTitle)
                 .fontWeight(.semibold)
 
-            Text("Drop audio files or folders, or choose them manually.")
+            Text("Check whether an audio file's spectral quality matches its claimed format.")
                 .foregroundStyle(.secondary)
 
             DropArea(isTargeted: $isDropTargeted)
@@ -40,44 +40,15 @@ struct ContentView: View {
                     return true
                 }
 
-            HStack(spacing: 12) {
-                Button("Choose Files") {
-                    viewModel.pickFiles()
-                }
-
-                Button("Choose Folder") {
-                    viewModel.pickFolder()
-                }
-
-                Button("Clear") {
-                    viewModel.clearQueue()
-                }
-                .disabled(viewModel.queuedFiles.isEmpty || viewModel.isRunning)
-
+            HStack {
                 Button("Open Selected in Finder") {
                     guard let selectedFileURL else { return }
                     viewModel.openInFinder(url: selectedFileURL)
                 }
                 .disabled(selectedFileURL == nil)
-
-                Toggle("Training Mode", isOn: $viewModel.trainingModeEnabled)
-                    .toggleStyle(.switch)
-                    .frame(width: 140)
-
-                Button("Export Training CSV") {
-                    viewModel.exportTrainingCSV()
-                }
-                .disabled(viewModel.trainingSamples.isEmpty || viewModel.isRunning)
-
                 Spacer()
-
-                Button(viewModel.isRunning ? "Running..." : "Run Validation") {
-                    Task {
-                        await viewModel.validateQueuedFiles()
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(viewModel.queuedFiles.isEmpty || viewModel.isRunning)
+                Text("\(viewModel.queuedFiles.count) file(s)")
+                    .foregroundStyle(.secondary)
             }
 
             if !viewModel.statusMessage.isEmpty {
@@ -91,6 +62,7 @@ struct ContentView: View {
                     Image(systemName: item.state.symbolName)
                         .foregroundStyle(item.state.colour)
                         .help(item.state.label)
+                        .accessibilityLabel(item.state.label)
                 }
                 .width(min: 34, ideal: 36)
 
@@ -101,35 +73,23 @@ struct ContentView: View {
                 }
                 .width(min: 220, ideal: 280)
 
-                TableColumn("Type", value: \.fileType) { item in
+                TableColumn("Format", value: \.fileType) { item in
                     Text(item.fileType)
                         .foregroundStyle(item.comparisonColor)
                 }
-                .width(min: 70, ideal: 90)
+                .width(min: 75, ideal: 90)
 
-                TableColumn("Reported Bitrate", value: \.sortReportedBitrate) { item in
-                    Text(item.reportedBitrate)
-                        .foregroundStyle(item.comparisonColor)
-                }
-                .width(min: 120, ideal: 150)
-
-                TableColumn("Mode", value: \.bitrateMode) { item in
-                    Text(item.bitrateMode)
-                        .foregroundStyle(item.comparisonColor)
-                }
-                .width(min: 70, ideal: 90)
-
-                TableColumn("Actual Bitrate", value: \.sortActualBitrate) { item in
+                TableColumn("Estimated Source", value: \.sortActualBitrate) { item in
                     Text(item.actualBitrate)
                         .foregroundStyle(item.comparisonColor)
                 }
-                .width(min: 120, ideal: 150)
+                .width(min: 110, ideal: 135)
 
-                TableColumn("Frequency", value: \.sortFrequencyKHz) { item in
+                TableColumn("Cutoff", value: \.sortFrequencyKHz) { item in
                     Text(item.frequency)
                         .foregroundStyle(item.comparisonColor)
                 }
-                .width(min: 130, ideal: 160)
+                .width(min: 105, ideal: 135)
 
                 TableColumn("Confidence", value: \.sortConfidencePercent) { item in
                     Text(item.confidence)
@@ -137,12 +97,21 @@ struct ContentView: View {
                 }
                 .width(min: 90, ideal: 110)
 
-                TableColumn("Status", value: \.analysisStatus) { item in
+                TableColumn("Verdict", value: \.analysisStatus) { item in
                     Text(item.analysisStatus)
                         .foregroundStyle(item.comparisonColor)
                 }
-                .width(min: 150, ideal: 200)
+                .width(min: 170, ideal: 230)
 
+            }
+            .overlay {
+                if sortedResults.isEmpty {
+                    ContentUnavailableView(
+                        "No audio queued",
+                        systemImage: "waveform.badge.plus",
+                        description: Text("Drop audio above or add files from the toolbar.")
+                    )
+                }
             }
             .contextMenu(forSelectionType: ValidationResult.ID.self) { selectedIDs in
                 if let selectedID = selectedIDs.first, let fileURL = fileURL(for: selectedID) {
@@ -158,6 +127,38 @@ struct ContentView: View {
             }
         }
         .padding(20)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button("Add Files", systemImage: "plus") {
+                    viewModel.pickFiles()
+                }
+
+                Button("Add Folder", systemImage: "folder.badge.plus") {
+                    viewModel.pickFolder()
+                }
+
+                Button("Clear", systemImage: "trash") {
+                    viewModel.clearQueue()
+                }
+                .disabled(viewModel.queuedFiles.isEmpty || viewModel.isRunning)
+
+                Menu("Training", systemImage: "wrench.and.screwdriver") {
+                    Toggle("Training Mode", isOn: $viewModel.trainingModeEnabled)
+                    Button("Export Training CSV") {
+                        viewModel.exportTrainingCSV()
+                    }
+                    .disabled(viewModel.trainingSamples.isEmpty || viewModel.isRunning)
+                }
+
+                Button(viewModel.isRunning ? "Running…" : "Run", systemImage: "play.fill") {
+                    Task {
+                        await viewModel.validateQueuedFiles()
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(viewModel.queuedFiles.isEmpty || viewModel.isRunning)
+            }
+        }
     }
 }
 
@@ -780,7 +781,7 @@ final class ValidationViewModel: ObservableObject {
                 state: .pending,
                 reportedBitrate: existing.reportedBitrate,
                 bitrateMode: existing.bitrateMode,
-                fileType: displayFileType(for: $0),
+                fileType: existing.fileType,
                 cutoffHz: nil
             )
         }
@@ -890,7 +891,7 @@ final class ValidationViewModel: ObservableObject {
             state: .pending,
             reportedBitrate: metadata.reportedBitrate,
             bitrateMode: metadata.bitrateMode,
-            fileType: displayFileType(for: file),
+            fileType: metadata.displayFormat,
             cutoffHz: nil
         )
     }
@@ -926,11 +927,6 @@ final class ValidationViewModel: ObservableObject {
         supportedAudioExtensions.contains(url.pathExtension.lowercased())
     }
 
-    private func displayFileType(for file: URL) -> String {
-        let ext = file.pathExtension.uppercased()
-        return ext.isEmpty ? "Unknown" : ext
-    }
-
     private func metadata(for file: URL) -> FileMetadata {
         NativeTrueBitrateAnalyzer.inspect(file: file)
     }
@@ -957,7 +953,7 @@ final class ValidationViewModel: ObservableObject {
                 fileURL: url,
                 logImage: renderOutput.logImage,
                 linearImage: renderOutput.linearImage,
-                fileType: displayFileType(for: url),
+                fileType: metadata.displayFormat,
                 reportedBitrate: metadata.reportedBitrate,
                 reportedSampleRateHz: renderOutput.sampleRateHz,
                 durationSeconds: renderOutput.durationSeconds,
@@ -1037,21 +1033,26 @@ final class ValidationViewModel: ObservableObject {
 
 }
 
-private nonisolated enum NativeTrueBitrateAnalyzer {
+nonisolated enum NativeTrueBitrateAnalyzer {
     static func inspect(file: URL) -> FileMetadata {
         do {
             let audioFile = try AVAudioFile(forReading: file)
             let format = audioFile.processingFormat
             return metadata(from: audioFile, fileURL: file, format: format)
         } catch {
-            return FileMetadata(reportedBitrate: "N/A", bitrateMode: "Unknown")
+            return FileMetadata(
+                reportedBitrate: "N/A",
+                bitrateMode: "Unknown",
+                codecName: "Unknown",
+                containerName: containerName(for: file)
+            )
         }
     }
 
     static func analyze(file: URL) -> RunResult {
         do {
             let samples = try loadSamples(from: file, maxSeconds: 30)
-            guard samples.channel.count >= samplesPerWindow(samples.sampleRate) else {
+            guard samples.regionRanges.contains(where: { $0.count >= samplesPerWindow(samples.sampleRate) }) else {
                 return RunResult(
                     success: false,
                     actualBitrate: "N/A",
@@ -1101,35 +1102,57 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
         }
         let metadata = metadata(from: file, fileURL: fileURL, format: format)
 
-        // For tracks longer than 60 s, skip the first 20% to avoid silent intros and
-        // fade-ins that would bias the spectral average toward content-sparse audio.
-        // This gives a much more representative sample of the steady-state signal.
-        let thresholdFrames = AVAudioFramePosition(sampleRate * 60)
-        let skipFraction: Double = file.length > thresholdFrames ? 0.20 : 0.0
-        let startFrame = AVAudioFramePosition(Double(file.length) * skipFraction)
-        file.framePosition = startFrame
-
         let maxFrames = AVAudioFramePosition(sampleRate * maxSeconds)
-        let availableFrames = max(0, file.length - startFrame)
-        let framesToRead = AVAudioFrameCount(min(availableFrames, maxFrames))
-        guard
-            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: framesToRead)
-        else {
-            throw AnalyzerError.bufferCreationFailed
+        let totalFramesToRead = min(file.length, maxFrames)
+        guard totalFramesToRead > 0 else { throw AnalyzerError.noAudioData }
+
+        let regionCount = file.length > maxFrames ? 5 : 1
+        let baseRegionLength = totalFramesToRead / AVAudioFramePosition(regionCount)
+        let remainder = totalFramesToRead % AVAudioFramePosition(regionCount)
+        let maxStart = max(0, file.length - baseRegionLength)
+        var channels = Array(repeating: [Float](), count: Int(format.channelCount))
+        var regionRanges: [Range<Int>] = []
+
+        for regionIndex in 0..<regionCount {
+            let regionLength = baseRegionLength + (regionIndex == regionCount - 1 ? remainder : 0)
+            guard regionLength > 0 else { continue }
+            let startFrame: AVAudioFramePosition
+            if regionCount == 1 {
+                startFrame = 0
+            } else {
+                startFrame = AVAudioFramePosition(
+                    (Double(maxStart) * Double(regionIndex) / Double(regionCount - 1)).rounded()
+                )
+            }
+            file.framePosition = startFrame
+
+            let frameCount = AVAudioFrameCount(regionLength)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+                throw AnalyzerError.bufferCreationFailed
+            }
+            try file.read(into: buffer, frameCount: frameCount)
+            guard buffer.frameLength > 0 else { continue }
+
+            let extractedChannels = try extractChannelData(from: buffer)
+            guard extractedChannels.count == channels.count, let extractedLength = extractedChannels.first?.count else {
+                throw AnalyzerError.noAudioData
+            }
+            let destinationStart = channels.first?.count ?? 0
+            for channelIndex in channels.indices {
+                channels[channelIndex].append(contentsOf: extractedChannels[channelIndex])
+            }
+            regionRanges.append(destinationStart..<(destinationStart + extractedLength))
         }
 
-        try file.read(into: buffer, frameCount: framesToRead)
-        guard buffer.frameLength > 0 else {
-            throw AnalyzerError.noAudioData
-        }
-
-        let channelData = try extractChannelData(from: buffer)
+        guard !channels.isEmpty, !regionRanges.isEmpty else { throw AnalyzerError.noAudioData }
+        let formatID = file.fileFormat.streamDescription.pointee.mFormatID
         return AudioSamples(
             sampleRate: sampleRate,
-            channel: channelData,
+            channels: channels,
+            regionRanges: regionRanges,
             reportedBitrate: metadata.reportedBitrate,
             bitrateMode: metadata.bitrateMode,
-            codecProfile: codecProfile(for: fileURL)
+            codecProfile: CodecProfile.detect(formatID: formatID, fileExtension: fileURL.pathExtension)
         )
     }
 
@@ -1139,7 +1162,14 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
         }
 
         let reported = reportedBitrateFromSizeAndDuration(file: file, fileURL: fileURL, format: format) ?? "N/A"
-        return FileMetadata(reportedBitrate: reported, bitrateMode: "Unknown")
+        let formatID = file.fileFormat.streamDescription.pointee.mFormatID
+        let profile = CodecProfile.detect(formatID: formatID, fileExtension: fileURL.pathExtension)
+        return FileMetadata(
+            reportedBitrate: reported,
+            bitrateMode: "Unknown",
+            codecName: profile.displayName,
+            containerName: containerName(for: fileURL)
+        )
     }
 
     private static func metadataFromAudioToolbox(fileURL: URL) -> FileMetadata? {
@@ -1177,7 +1207,16 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
             }
         }
 
-        return FileMetadata(reportedBitrate: reported, bitrateMode: mode)
+        let profile = CodecProfile.detect(
+            formatID: hasASBD ? asbd.mFormatID : nil,
+            fileExtension: fileURL.pathExtension
+        )
+        return FileMetadata(
+            reportedBitrate: reported,
+            bitrateMode: mode,
+            codecName: profile.displayName,
+            containerName: containerName(for: fileURL)
+        )
     }
 
     private static func reportedBitrateFromSizeAndDuration(file: AVAudioFile, fileURL: URL, format: AVAudioFormat) -> String? {
@@ -1202,36 +1241,33 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
         return nil
     }
 
-    private static func codecProfile(for fileURL: URL) -> CodecProfile {
-        switch fileURL.pathExtension.lowercased() {
-        case "mp3":
-            return .mp3
-        case "m4a", "aac":
-            return .aac
-        case "ogg", "opus":
-            return .opus
-        case "flac", "alac", "wav", "aiff", "aif":
-            return .lossless
-        default:
-            return .generic
-        }
+    private static func containerName(for fileURL: URL) -> String {
+        let fileExtension = fileURL.pathExtension.uppercased()
+        return fileExtension.isEmpty ? "Unknown" : fileExtension
     }
 
-    private static func extractChannelData(from buffer: AVAudioPCMBuffer) throws -> [Float] {
+    private static func extractChannelData(from buffer: AVAudioPCMBuffer) throws -> [[Float]] {
         let frameCount = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        guard frameCount > 0, channelCount > 0 else { throw AnalyzerError.noAudioData }
         switch buffer.format.commonFormat {
         case .pcmFormatFloat32:
             guard let channels = buffer.floatChannelData else { throw AnalyzerError.noAudioData }
-            let source = channels[0]
-            return Array(UnsafeBufferPointer(start: source, count: frameCount))
+            return (0..<channelCount).map { channelIndex in
+                Array(UnsafeBufferPointer(start: channels[channelIndex], count: frameCount))
+            }
         case .pcmFormatInt16:
             guard let channels = buffer.int16ChannelData else { throw AnalyzerError.noAudioData }
-            let source = channels[0]
-            return (0..<frameCount).map { Float(source[$0]) / Float(Int16.max) }
+            return (0..<channelCount).map { channelIndex in
+                let source = channels[channelIndex]
+                return (0..<frameCount).map { Float(source[$0]) / Float(Int16.max) }
+            }
         case .pcmFormatInt32:
             guard let channels = buffer.int32ChannelData else { throw AnalyzerError.noAudioData }
-            let source = channels[0]
-            return (0..<frameCount).map { Float(source[$0]) / Float(Int32.max) }
+            return (0..<channelCount).map { channelIndex in
+                let source = channels[channelIndex]
+                return (0..<frameCount).map { Float(source[$0]) / Float(Int32.max) }
+            }
         default:
             throw AnalyzerError.unsupportedPCMFormat
         }
@@ -1242,7 +1278,7 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
     private static let analysisFFTLength = 8192
     private static let analysisHopFraction = 0.5 // 50% overlap
 
-    private static func estimateBitrate(from audio: AudioSamples) throws -> BitrateEstimate {
+    static func estimateBitrate(from audio: AudioSamples) throws -> BitrateEstimate {
         let sampleRate = audio.sampleRate
         let fftLength = analysisFFTLength
         let hopLength = Int(Double(fftLength) * analysisHopFraction)
@@ -1251,9 +1287,13 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
         let frequencyResolution = Double(sampleRate) / Double(fftLength)
         let profile = audio.codecProfile
 
-        let maxSegments = (audio.channel.count - fftLength) / hopLength + 1
-        guard maxSegments > 0 else { throw AnalyzerError.noAudioData }
-        let segmentCount = min(maxSegments, 200)
+        let segmentStarts = analysisWindowStarts(
+            regionRanges: audio.regionRanges,
+            fftLength: fftLength,
+            hopLength: hopLength,
+            maxWindows: 200
+        )
+        guard !audio.channels.isEmpty, !segmentStarts.isEmpty else { throw AnalyzerError.noAudioData }
 
         var hannWindow = [Float](repeating: 0, count: fftLength)
         vDSP_hann_window(&hannWindow, vDSP_Length(fftLength), Int32(vDSP_HANN_NORM))
@@ -1271,41 +1311,44 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
         var power = [Float](repeating: 0, count: freqBins)
         var segmentCutoffRatios: [Double] = []
 
-        for seg in 0..<segmentCount {
-            let start = seg * hopLength
+        var transformCount = 0
+        for start in segmentStarts {
             let end = start + fftLength
-            guard end <= audio.channel.count else { break }
+            for channel in audio.channels {
+                guard end <= channel.count else { continue }
 
-            var windowed = Array(audio.channel[start..<end])
-            vDSP.multiply(windowed, hannWindow, result: &windowed)
+                var windowed = Array(channel[start..<end])
+                vDSP.multiply(windowed, hannWindow, result: &windowed)
 
-            real.withUnsafeMutableBufferPointer { rp in
-                imag.withUnsafeMutableBufferPointer { ip in
-                    guard let rb = rp.baseAddress, let ib = ip.baseAddress else { return }
-                    var split = DSPSplitComplex(realp: rb, imagp: ib)
-                    windowed.withUnsafeBufferPointer { wp in
-                        wp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: freqBins) { cp in
-                            vDSP_ctoz(cp, 2, &split, 1, vDSP_Length(freqBins))
+                real.withUnsafeMutableBufferPointer { rp in
+                    imag.withUnsafeMutableBufferPointer { ip in
+                        guard let rb = rp.baseAddress, let ib = ip.baseAddress else { return }
+                        var split = DSPSplitComplex(realp: rb, imagp: ib)
+                        windowed.withUnsafeBufferPointer { wp in
+                            wp.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: freqBins) { cp in
+                                vDSP_ctoz(cp, 2, &split, 1, vDSP_Length(freqBins))
+                            }
                         }
+                        fft.forward(input: split, output: &split)
+                        vDSP_zvabs(&split, 1, &magnitudes, 1, vDSP_Length(freqBins))
                     }
-                    fft.forward(input: split, output: &split)
-                    vDSP_zvabs(&split, 1, &magnitudes, 1, vDSP_Length(freqBins))
                 }
+
+                // Combining channels in the power domain avoids phase cancellation.
+                vDSP.multiply(magnitudes, magnitudes, result: &power)
+                vDSP.add(averagedPower, power, result: &averagedPower)
+                transformCount += 1
+
+                // Per-channel, per-window estimates retain temporal and channel disagreement.
+                let localDb = power.map { 10.0 * log10f(max($0, 1.0e-24)) }
+                let localSmoothed = movingAverage(localDb, window: max(3, freqBins / 80))
+                let localCutoff = cutoffGradient(spectrum: localSmoothed, frequencyResolution: frequencyResolution)
+                segmentCutoffRatios.append(localCutoff / nyquistHz)
             }
-
-            // Squared magnitudes → power spectrum
-            vDSP.multiply(magnitudes, magnitudes, result: &power)
-            vDSP.add(averagedPower, power, result: &averagedPower)
-
-            // Per-segment cutoff for stability analysis
-            let localDb = power.map { 10.0 * log10f(max($0, 1.0e-24)) }
-            let localSmoothed = movingAverage(localDb, window: max(3, freqBins / 80))
-            let localCutoff = cutoffGradient(spectrum: localSmoothed, frequencyResolution: frequencyResolution)
-            segmentCutoffRatios.append(localCutoff / nyquistHz)
         }
 
-        let actualSegments = min(segmentCount, (audio.channel.count - fftLength) / hopLength + 1)
-        let scaling = Float(1.0 / Double(max(actualSegments, 1)))
+        guard transformCount > 0 else { throw AnalyzerError.noAudioData }
+        let scaling = Float(1.0 / Double(transformCount))
         vDSP.multiply(scaling, averagedPower, result: &averagedPower)
 
         // Convert averaged power to dB
@@ -1336,7 +1379,7 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
 
         // --- Stability ---
         let stability = stabilityScore(segmentCutoffRatios)
-        let sampleSupport = normalized(value: Double(actualSegments), minValue: 6, maxValue: 60)
+        let sampleSupport = normalized(value: Double(segmentStarts.count), minValue: 6, maxValue: 60)
 
         // --- Lossless discrimination (multi-feature) ---
         let losslessScore =
@@ -1407,6 +1450,25 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
             confidence: confidence,
             isLosslessContainer: profile == .lossless
         )
+    }
+
+    static func analysisWindowStarts(
+        regionRanges: [Range<Int>],
+        fftLength: Int = analysisFFTLength,
+        hopLength: Int = Int(Double(analysisFFTLength) * analysisHopFraction),
+        maxWindows: Int = 200
+    ) -> [Int] {
+        guard fftLength > 0, hopLength > 0, maxWindows > 0 else { return [] }
+        let candidates = regionRanges.flatMap { region -> [Int] in
+            guard region.count >= fftLength else { return [] }
+            return Array(stride(from: region.lowerBound, through: region.upperBound - fftLength, by: hopLength))
+        }
+        guard candidates.count > maxWindows else { return candidates }
+        guard maxWindows > 1 else { return [candidates[candidates.count / 2]] }
+        return (0..<maxWindows).map { index in
+            let position = Double(index) * Double(candidates.count - 1) / Double(maxWindows - 1)
+            return candidates[Int(position.rounded())]
+        }
     }
 
     // MARK: - Cutoff Detection Methods
@@ -1617,27 +1679,69 @@ private nonisolated enum NativeTrueBitrateAnalyzer {
     }
 }
 
-private struct AudioSamples {
+nonisolated struct AudioSamples {
     let sampleRate: Int
-    let channel: [Float]
+    let channels: [[Float]]
+    let regionRanges: [Range<Int>]
     let reportedBitrate: String
     let bitrateMode: String
     let codecProfile: CodecProfile
 }
 
-private struct FileMetadata {
+nonisolated struct FileMetadata {
     let reportedBitrate: String
     let bitrateMode: String
+    let codecName: String
+    let containerName: String
+
+    var displayFormat: String {
+        codecName == containerName ? codecName : "\(containerName) · \(codecName)"
+    }
 }
 
-private nonisolated enum CodecProfile {
+nonisolated enum CodecProfile: Equatable {
     case mp3
     case aac
     case opus
     case lossless
     case generic
 
-    /// Hz-precision bitrate buckets at 44100 Hz reference sample rate.
+    var displayName: String {
+        switch self {
+        case .mp3: return "MP3"
+        case .aac: return "AAC"
+        case .opus: return "Opus"
+        case .lossless: return "Lossless"
+        case .generic: return "Unknown"
+        }
+    }
+
+    static func detect(formatID: AudioFormatID?, fileExtension: String) -> CodecProfile {
+        if let formatID {
+            switch formatID {
+            case kAudioFormatMPEGLayer3:
+                return .mp3
+            case kAudioFormatMPEG4AAC, kAudioFormatMPEG4AAC_HE, kAudioFormatMPEG4AAC_HE_V2:
+                return .aac
+            case kAudioFormatOpus:
+                return .opus
+            case kAudioFormatAppleLossless, kAudioFormatFLAC, kAudioFormatLinearPCM:
+                return .lossless
+            default:
+                break
+            }
+        }
+
+        switch fileExtension.lowercased() {
+        case "mp3": return .mp3
+        case "aac": return .aac
+        case "opus", "ogg": return .opus
+        case "flac", "alac", "wav", "aiff", "aif": return .lossless
+        default: return .generic
+        }
+    }
+
+    /// Hz-precision bitrate buckets expressed as absolute decoded bandwidths.
     /// Each tuple: (lowHz, highHz, centerHz, label)
     private typealias Bucket = (lo: Double, hi: Double, center: Double, label: String)
 
@@ -1676,21 +1780,21 @@ private nonisolated enum CodecProfile {
     }
 
     /// Classify a cutoff frequency (in Hz) to a bitrate label using Hz-precision thresholds.
-    /// Thresholds are scaled proportionally for non-44100 Hz sample rates.
+    /// Output sample rate is deliberately not used to scale an earlier source's bandwidth.
     func classifyContinuous(cutoffHz: Double, sampleRate: Int) -> (label: String, score: Double) {
-        let scale = Double(sampleRate) / 44100.0
+        _ = sampleRate
         let buckets = referenceBuckets
         var bestLabel = "unknown"
         var bestScore = 0.35
 
         for bucket in buckets {
-            let lo = bucket.lo * scale
-            let hi = bucket.hi * scale
-            let center = bucket.center * scale
+            let lo = bucket.lo
+            let hi = bucket.hi
+            let center = bucket.center
 
             if cutoffHz >= lo && cutoffHz <= hi {
                 let spread = (hi - lo) * 0.55
-                let score = gaussianScore(cutoffHz, center: center, spread: spread)
+                let score = distanceScore(cutoffHz, center: center, spread: spread)
                 if score > bestScore {
                     bestScore = score
                     bestLabel = bucket.label
@@ -1700,7 +1804,7 @@ private nonisolated enum CodecProfile {
                 let distance = cutoffHz < lo ? lo - cutoffHz : cutoffHz - hi
                 let spread = (hi - lo) * 0.55
                 if distance < spread * 2 {
-                    let score = gaussianScore(cutoffHz, center: center, spread: spread) * 0.8
+                    let score = distanceScore(cutoffHz, center: center, spread: spread) * 0.8
                     if score > bestScore {
                         bestScore = score
                         bestLabel = bucket.label
@@ -1712,7 +1816,7 @@ private nonisolated enum CodecProfile {
         return (bestLabel, bestScore)
     }
 
-    private func gaussianScore(_ value: Double, center: Double, spread: Double) -> Double {
+    private func distanceScore(_ value: Double, center: Double, spread: Double) -> Double {
         guard spread > 0 else { return 0 }
         let distance = abs(value - center)
         let score = exp(-distance / spread)
@@ -1720,7 +1824,7 @@ private nonisolated enum CodecProfile {
     }
 }
 
-private nonisolated struct BitrateEstimate {
+nonisolated struct BitrateEstimate {
     let cutoffHz: Double
     let nyquistHz: Double
     let inferredBitrate: String
@@ -1743,7 +1847,7 @@ private nonisolated struct BitrateEstimate {
         String(format: "%.1f", cutoffHz / 1_000.0)
     }
 
-    private var cutoffRatio: Double {
+    var cutoffRatio: Double {
         cutoffHz / nyquistHz
     }
 
@@ -1845,7 +1949,7 @@ private enum AnalyzerError: LocalizedError {
     }
 }
 
-private struct RunResult {
+nonisolated struct RunResult {
     let success: Bool
     let actualBitrate: String
     let frequency: String
@@ -1857,7 +1961,7 @@ private struct RunResult {
     let cutoffHz: Double?
 }
 
-struct AnalysisFeatures {
+nonisolated struct AnalysisFeatures {
     let cutoffKHz: Double
     let cutoffRatio: Double
     let dropScore: Double
@@ -1899,7 +2003,7 @@ struct TrainingSample {
     let features: AnalysisFeatures?
 }
 
-private enum TrainingLabelParser {
+nonisolated enum TrainingLabelParser {
     static func parse(fileName: String, reportedBitrate: String) -> (label: String, type: String, isTrainable: Bool) {
         let uppercased = fileName.uppercased()
         if uppercased.contains("[CORRUPTED]") {
@@ -1914,11 +2018,8 @@ private enum TrainingLabelParser {
             return ("unparsed_tag", "unknown_tag", false)
         }
 
-        let normalizedReported = normalize(reportedBitrate)
-        guard !normalizedReported.isEmpty else {
-            return ("missing_reported", "aligned_reported", false)
-        }
-        return (normalizedReported, "aligned_reported", true)
+        _ = reportedBitrate
+        return ("", "unlabelled", false)
     }
 
     static func normalize(_ value: String) -> String {
@@ -1953,7 +2054,7 @@ private enum TrainingLabelParser {
 }
 
 struct ValidationResult: Identifiable {
-    let id = UUID()
+    var id: String { fileURL.standardizedFileURL.path }
     let fileURL: URL
     var actualBitrate: String
     var frequency: String

@@ -25,7 +25,7 @@ All common lossy codecs (MP3, AAC, Opus) apply a low-pass filter during encoding
 | 320 kbps | ~20.25 kHz | 0.92 | 20000–20500 Hz |
 | Lossless | ~Nyquist | ≥ 0.96 | — |
 
-All Hz ranges scale proportionally for other sample rates: `threshold × (sampleRate / 44100)`.
+These ranges are treated as **absolute decoded bandwidths**. They are not scaled with the output sample rate: a 16 kHz shelf remains evidence at 16 kHz when a lower-rate source has been transcoded into a 44.1, 48, or 96 kHz file. The tables are provisional and still require encoder- and corpus-based calibration.
 
 ### AAC-LC Cutoff Reference — 44.1 kHz
 
@@ -55,14 +55,21 @@ All Hz ranges scale proportionally for other sample rates: `threshold × (sample
 ### 1. Sample Loading
 
 ```
-if file.duration > 60 s:
-    startFrame = file.length × 0.20   // skip silent intros
-else:
-    startFrame = 0
+frameBudget = min(file.length, sampleRate × 30)
 
-framesToRead = min(availableFrames, sampleRate × 30)
-samples = mono Float32 PCM in [-1.0, 1.0]
+if file.length ≤ frameBudget:
+    regions = [the complete file]
+else:
+    regions = 5 evenly distributed ranges whose combined length is frameBudget
+
+for each region:
+    seek to region.start
+    decode every channel as PCM
+    append each channel to its analysis buffer
+    record the appended range as a region boundary
 ```
+
+Region boundaries are retained so an FFT window can never bridge two non-contiguous parts of the source. Analysing channels separately in the power domain preserves content that appears in only one channel and avoids phase cancellation from a premature mono mix.
 
 ### 2. Welch's Method — Power Spectral Density
 
@@ -70,12 +77,13 @@ samples = mono Float32 PCM in [-1.0, 1.0]
 fftLength = 8192
 hopLength = fftLength × 0.50    // 50% overlap
 freqBins  = fftLength / 2       // 4096 bins
-maxSegments = (totalSamples - fftLength) / hopLength + 1
-segmentCount = min(maxSegments, 200)
+candidateStarts = every valid hop-aligned start within each sampled region
+segmentStarts   = at most 200 starts selected evenly across candidateStarts
+transformCount  = 0
 
-for each segment s in [0, segmentCount):
-    start = s × hopLength
-    windowed[i] = samples[start + i] × hannWindow[i]    for i in [0, fftLength)
+for each start in segmentStarts:
+  for each decoded channel:
+    windowed[i] = channel[start + i] × hannWindow[i]   for i in [0, fftLength)
 
     // Real FFT: reinterpret float buffer as complex pairs
     // windowed[0,1] → complex[0].re, complex[0].im  etc.
@@ -85,8 +93,9 @@ for each segment s in [0, segmentCount):
 
     power[k] = magnitudes[k]²                          for k in [0, freqBins)
     averagedPower += power
+    transformCount += 1
 
-averagedPower /= segmentCount
+averagedPower /= transformCount
 
 spectrumDb[k] = 10 × log₁₀(max(averagedPower[k], 1e-24))
 smoothedDb    = movingAverage(spectrumDb, window = max(3, freqBins / 80))
@@ -258,23 +267,18 @@ else                     →  classify as upconverted lossy (use Hz-precision bu
 
 ## Hz-Precision Bitrate Classification
 
-Classification uses Gaussian-weighted scoring over Hz-precision threshold ranges scaled for any sample rate.
+Classification uses distance-weighted scoring over absolute Hz threshold ranges. `sampleRate` is retained in the current API but deliberately does not rescale the ranges.
 
 ```
 func classifyContinuous(cutoffHz, sampleRate):
-    scale = sampleRate / 44100.0
-
     for each bucket (lo, hi, center, label) in codecBuckets:
-        lo_scaled     = lo × scale
-        hi_scaled     = hi × scale
-        center_scaled = center × scale
-        spread        = (hi_scaled - lo_scaled) × 0.55
+        spread = (hi - lo) × 0.55
 
-        if lo_scaled ≤ cutoffHz ≤ hi_scaled:
-            score = exp(-|cutoffHz - center_scaled| / spread)
+        if lo ≤ cutoffHz ≤ hi:
+            score = exp(-|cutoffHz - center| / spread)
             score = clamp(score, 0.30, 0.99)
         else if distance_to_range < spread × 2:
-            score = exp(-|cutoffHz - center_scaled| / spread) × 0.80
+            score = exp(-|cutoffHz - center| / spread) × 0.80
         else:
             skip
 
@@ -282,16 +286,16 @@ func classifyContinuous(cutoffHz, sampleRate):
     if no match: return ("unknown", 0.35)
 ```
 
-The Gaussian score naturally handles edge cases — a cutoff at 15800 Hz scores highly for both 128 kbps and 160 kbps buckets; the confidence model will reflect this ambiguity.
+The exponential distance score handles edge cases continuously rather than snapping every cutoff directly to a bucket. The bucket ranges themselves remain provisional until validated against independently labelled encodes.
 
 ---
 
 ## Per-Segment Stability
 
-Stability measures how consistently the cutoff is detected across all overlapping segments, using the gradient method applied per-segment.
+Stability measures how consistently the cutoff is detected across sampled windows and decoded channels, using the gradient method for each channel/window transform.
 
 ```
-for each segment:
+for each sampled window and channel:
     segmentCutoffRatios.append(gradientCutoff(segment) / nyquistHz)
 
 mean = average(segmentCutoffRatios)
@@ -309,7 +313,7 @@ A codec shelf at a fixed frequency → low stdDev → high stability. Natural co
 
 ```
 highBandSuppression = 1 - normalized(highBandEnergyRatio, 0.001, 0.10)
-sampleSupport       = normalized(segmentCount, 6, 60)
+sampleSupport       = normalized(sampledWindowCount, 6, 60)
 
 evidenceConfidence =
     clamp(
@@ -365,5 +369,5 @@ On the spectrogram, a fake lossless file shows a horizontal "wall" — a sharp, 
 
 - **HE-AAC / SBR**: Spectral Band Replication synthesises high-frequency energy from low-frequency content. This creates artificial content above the actual coding cutoff, causing the energy ratio method to over-estimate the cutoff. Detected as high-bitrate AAC when it may be low-bitrate HE-AAC. Future work: cross-correlation of low/high band envelopes to detect SBR symmetry.
 - **Very short files**: Files under ~8 seconds yield fewer than 6 Welch segments, reducing stability and suppression evidence. Confidence is appropriately reduced via `sampleSupport`.
-- **Non-44.1/48 kHz files**: All thresholds scale by `sampleRate / 44100`, but encoder behaviour at uncommon sample rates (e.g. 96 kHz) has not been empirically validated.
+- **High-sample-rate files**: Absolute source-bandwidth mapping avoids the previous proportional-scaling error, but encoder behaviour and genuinely ultrasonic content at uncommon sample rates have not yet been empirically validated.
 - **VBR MP3**: Variable bitrate files show per-segment cutoff variation. The stability penalty reduces confidence appropriately, but the inferred bitrate reflects the average rather than the minimum.
