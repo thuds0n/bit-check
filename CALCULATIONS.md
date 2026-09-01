@@ -294,7 +294,7 @@ The named tiers form the product's granular bitrate vocabulary. A valid cutoff a
 
 ## Full-Stream Technical Evidence
 
-An opt-in full-stream pass now exposes raw evidence for technical-quality evaluation. It is deliberately separate from the quick spectral result path until batch cancellation, bounded concurrency, and defect thresholds are ready.
+A default-on full-stream pass exposes raw evidence for technical-quality evaluation and can be disabled from the Analysis menu. It shares the bounded, cancellable batch scheduler with spectral analysis; cancellation is checked between decode chunks.
 
 ```
 chunkFrames = 32768
@@ -314,7 +314,7 @@ durationShortfall    = max(0, declaredFrames - decodedFrames) / sampleRate
 durationShortfallPct = max(0, declaredFrames - decodedFrames) / declaredFrames
 ```
 
-A full-read error is technical defect evidence. A duration shortfall must exceed both one second and 0.5% of the declared frames to avoid normal codec padding. Clipping and silence are currently retained as measurements rather than converted directly into a defect verdict: both are programme-dependent, and the available composite labels do not reveal which user-configurable check produced them.
+A full-read error is technical defect evidence. A duration shortfall must exceed both one second and 0.5% of the declared frames to avoid normal codec padding. Either condition can override the spectral verdict. Clipping and silence are retained as measurements rather than converted directly into a defect verdict: both are programme-dependent, and the available composite labels do not reveal which user-configurable check produced them.
 
 ---
 
@@ -331,9 +331,18 @@ variance = average((ratio - mean)² for ratio in segmentCutoffRatios)
 stdDev = sqrt(variance)
 
 segmentStability = clamp(1 - (stdDev / 0.12), 0, 1)
+
+sortedCutoffs = sort(segmentCutoffHz)
+temporalP10   = percentile(sortedCutoffs, 0.10)
+temporalMedian = percentile(sortedCutoffs, 0.50)
+temporalP90   = percentile(sortedCutoffs, 0.90)
+temporalSpread = temporalP90 - temporalP10
+
+shelfPersistence = count(abs(segmentCutoffHz - fusedCutoffHz) ≤ 1000 Hz)
+                   / segmentCutoffCount
 ```
 
-A codec shelf at a fixed frequency → low stdDev → high stability. Natural content without a shelf → variable per-segment cutoffs → low stability.
+A codec shelf at a fixed frequency produces low standard deviation, narrow percentile spread, and high shelf persistence. Natural content without a shelf produces a broader, less persistent distribution. The percentile and persistence fields are retained through `AnalysisFeatures` and CSV export for future encoder- and mode-specific classification; they do not yet alter the bitrate tier directly.
 
 ---
 
@@ -425,6 +434,6 @@ On the spectrogram, a fake lossless file shows a horizontal "wall" — a sharp, 
 - **HE-AAC / SBR**: Spectral Band Replication synthesises high-frequency energy from low-frequency content. This creates artificial content above the actual coding cutoff, causing the energy ratio method to over-estimate the cutoff. Detected as high-bitrate AAC when it may be low-bitrate HE-AAC. Future work: cross-correlation of low/high band envelopes to detect SBR symmetry.
 - **Very short files**: Files under ~8 seconds yield fewer than 6 Welch segments, reducing stability and suppression evidence. Confidence is appropriately reduced via `sampleSupport`.
 - **High-sample-rate files**: Absolute source-bandwidth mapping avoids the previous proportional-scaling error, but encoder behaviour and genuinely ultrasonic content at uncommon sample rates have not yet been empirically validated.
-- **VBR MP3**: Variable bitrate files show per-segment cutoff variation. The stability penalty reduces confidence appropriately, but the inferred bitrate reflects the average rather than the minimum.
+- **VBR MP3**: Variable bitrate files show per-segment cutoff variation. Stability, percentile spread, and shelf persistence now preserve that behaviour, but the inferred tier still comes from the globally fused cutoff.
 - **Encoder-dependent bitrate tiers**: A runtime-generated Apple AAC encode labelled 128 kbps retained a cutoff around 18.7 kHz and currently maps to the provisional 192 kbps AAC bucket. Cutoff frequency alone is therefore insufficient for reliable source-bitrate claims across encoders.
-- **Native corpus coverage**: The deterministic runtime corpus currently covers AAC, ALAC, FLAC, and AAC-to-ALAC transcoding. The built-in MP3 and Opus encoder paths advertised by `afconvert` fail on the current host, so those codecs still require independently generated reference fixtures.
+- **Corpus coverage**: The deterministic native runtime corpus covers AAC, ALAC, FLAC, and AAC-to-ALAC transcoding. Test-only external encoders add LAME MP3 and Opus CBR/VBR coverage when available; these tools are not linked, bundled, or required by the application. HE-AAC and broader encoder diversity remain pending.

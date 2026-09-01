@@ -101,6 +101,22 @@ struct BitCheckTests {
         #expect(evidence.agreement > 0.60)
     }
 
+    @Test func temporalCutoffEvidenceRetainsDistributionAndPersistence() {
+        let evidence = NativeTrueBitrateAnalyzer.temporalCutoffEvidence(
+            segmentCutoffsHz: [
+                15_900, 16_000, 16_000, 16_050, 16_100,
+                16_100, 16_150, 16_200, 19_800, 20_000,
+            ],
+            referenceCutoffHz: 16_000
+        )
+
+        #expect(evidence.sampleCount == 10)
+        #expect(evidence.lowerPercentileHz < evidence.medianHz)
+        #expect(evidence.medianHz < evidence.upperPercentileHz)
+        #expect(evidence.percentileSpreadHz > 3_000)
+        #expect(evidence.shelfPersistence == 0.8)
+    }
+
     @Test func analysisIncludesAudioPresentOnlyInSecondChannel() throws {
         let sampleRate = 44_100
         let sampleCount = sampleRate * 2
@@ -159,6 +175,26 @@ struct BitCheckTests {
         #expect(evidence.longestSilenceSeconds >= 1.9)
     }
 
+    @Test func deepAnalysisRetainsTechnicalEvidenceWithoutOverclassifyingClipping() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appending(path: "bit-check-deep-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try writeTechnicalQualitySource(to: fileURL)
+
+        let result = NativeTrueBitrateAnalyzer.analyze(
+            file: fileURL,
+            includeTechnicalEvidence: true
+        )
+        let evidence = try #require(result.technicalEvidence)
+
+        #expect(result.success)
+        #expect(evidence.clippingRatio > 0.20)
+        #expect(evidence.longestSilenceSeconds >= 1.9)
+        if case .technicallyDefective = result.verdict {
+            Issue.record("Raw clipping or silence evidence must not become a stream-defect verdict without calibration")
+        }
+    }
+
     @Test func nativeCodecCorpusSeparatesGenuineAndTranscodedLossless() throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "bit-check-corpus-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -212,6 +248,42 @@ struct BitCheckTests {
         }
     }
 
+    @Test func externalEncoderCorpusCoversMP3AndOpusModesWhenAvailable() throws {
+        guard let ffmpegURL = externalFFmpegURL() else { return }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "bit-check-external-codecs-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let source = directory.appending(path: "broadband-source.wav")
+        try writeBroadbandSource(to: source, durationSeconds: 6)
+
+        let fixtures: [(name: String, codec: String, arguments: [String])] = [
+            ("mp3-cbr-128.mp3", "MP3", ["-c:a", "libmp3lame", "-b:a", "128k"]),
+            ("mp3-vbr-q2.mp3", "MP3", ["-c:a", "libmp3lame", "-q:a", "2"]),
+            ("opus-vbr-96.ogg", "Opus", ["-c:a", "libopus", "-b:a", "96k", "-vbr", "on"]),
+            ("opus-cbr-160.ogg", "Opus", ["-c:a", "libopus", "-b:a", "160k", "-vbr", "off"]),
+        ]
+
+        for fixture in fixtures {
+            let fileURL = directory.appending(path: fixture.name)
+            try convertWithFFmpeg(
+                ffmpegURL: ffmpegURL,
+                source: source,
+                destination: fileURL,
+                codecArguments: fixture.arguments
+            )
+
+            let metadata = NativeTrueBitrateAnalyzer.inspect(file: fileURL)
+            let result = NativeTrueBitrateAnalyzer.analyze(file: fileURL)
+            #expect(metadata.codecName == fixture.codec, "Unexpected codec for \(fixture.name)")
+            #expect(result.success, "Analysis failed for \(fixture.name): \(result.analysisStatus)")
+            #expect(result.features != nil, "No analysis features for \(fixture.name)")
+            #expect(result.cutoffHz ?? 0 > 0, "No cutoff evidence for \(fixture.name)")
+        }
+    }
+
     @Test func explicitVerdictsCoverCurrentResultClasses() {
         #expect(
             estimate(inferredBitrate: "lossless", cutoffHz: 21_500, confidence: 0.8, isLossless: true).verdict
@@ -252,6 +324,54 @@ struct BitCheckTests {
         #expect(first.id == fileURL.standardizedFileURL.path)
     }
 
+    @MainActor
+    @Test func batchValidationRespectsItsConcurrencyLimit() async {
+        let recorder = AnalysisConcurrencyRecorder(delay: 0.04)
+        let viewModel = ValidationViewModel(maxConcurrentAnalyses: 2) { file, _ in
+            recorder.analyse(file)
+        }
+        viewModel.queuedFiles = (0..<8).map {
+            URL(fileURLWithPath: "/tmp/bit-check-batch-\($0).mp3")
+        }
+
+        await viewModel.validateQueuedFiles()
+
+        #expect(viewModel.completedCount == 8)
+        #expect(viewModel.totalCount == 8)
+        #expect(recorder.maximumConcurrent == 2)
+        #expect(viewModel.results.allSatisfy { result in
+            if case .done = result.state { return true }
+            return false
+        })
+    }
+
+    @MainActor
+    @Test func cancellingABatchStopsSchedulingAndMarksUnfinishedRows() async throws {
+        let recorder = AnalysisConcurrencyRecorder(delay: 0.20, observesCancellation: true)
+        let viewModel = ValidationViewModel(maxConcurrentAnalyses: 2) { file, _ in
+            recorder.analyse(file)
+        }
+        viewModel.queuedFiles = (0..<12).map {
+            URL(fileURLWithPath: "/tmp/bit-check-cancel-\($0).mp3")
+        }
+
+        viewModel.startValidation()
+        try await Task.sleep(for: .milliseconds(40))
+        viewModel.cancelValidation()
+
+        while viewModel.isRunning {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(viewModel.completedCount < viewModel.totalCount)
+        #expect(recorder.startedCount <= 2)
+        #expect(viewModel.results.contains { result in
+            if case .cancelled = result.state { return true }
+            return false
+        })
+        #expect(viewModel.statusMessage.contains("cancelled"))
+    }
+
     /// Opt-in evaluator for an external, filename-labelled audio corpus.
     ///
     /// Set `BITCHECK_EVALUATION_CORPUS` to a directory and optionally
@@ -287,6 +407,11 @@ struct BitCheckTests {
             "energy_cutoff_khz",
             "noise_floor_cutoff_khz",
             "cutoff_agreement",
+            "temporal_cutoff_p10_khz",
+            "temporal_cutoff_median_khz",
+            "temporal_cutoff_p90_khz",
+            "temporal_cutoff_spread_khz",
+            "temporal_shelf_persistence",
             "evidence_confidence",
             "classification_confidence",
             "integrity_defective",
@@ -327,6 +452,11 @@ struct BitCheckTests {
                 features?.energyCutoffKHzText ?? "",
                 features?.noiseFloorCutoffKHzText ?? "",
                 features?.cutoffAgreementText ?? "",
+                features?.temporalCutoffP10KHzText ?? "",
+                features?.temporalCutoffMedianKHzText ?? "",
+                features?.temporalCutoffP90KHzText ?? "",
+                features?.temporalCutoffSpreadKHzText ?? "",
+                features?.temporalShelfPersistenceText ?? "",
                 features?.evidenceConfidenceText ?? "",
                 features?.classificationConfidenceText ?? "",
                 integrity.isTechnicallyDefective ? "true" : "false",
@@ -393,7 +523,15 @@ struct BitCheckTests {
             classificationConfidence: confidence,
             confidence: confidence,
             isLosslessContainer: isLossless,
-            cutoffEvidence: evidence
+            cutoffEvidence: evidence,
+            temporalCutoffEvidence: TemporalCutoffEvidence(
+                sampleCount: 1,
+                lowerPercentileHz: cutoffHz,
+                medianHz: cutoffHz,
+                upperPercentileHz: cutoffHz,
+                percentileSpreadHz: 0,
+                shelfPersistence: 1
+            )
         )
     }
 
@@ -508,6 +646,48 @@ struct BitCheckTests {
         }
     }
 
+    private func externalFFmpegURL() -> URL? {
+        let environment = ProcessInfo.processInfo.environment
+        let candidates = [
+            environment["BITCHECK_FFMPEG"],
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+        ].compactMap { $0 }
+        return candidates
+            .map { URL(fileURLWithPath: $0) }
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private func convertWithFFmpeg(
+        ffmpegURL: URL,
+        source: URL,
+        destination: URL,
+        codecArguments: [String]
+    ) throws {
+        let process = Process()
+        let errorPipe = Pipe()
+        process.executableURL = ffmpegURL
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errorPipe
+        process.arguments = [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", source.path,
+        ] + codecArguments + [destination.path]
+        try process.run()
+        process.waitUntilExit()
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorText = String(decoding: errorData, as: UTF8.self)
+        guard process.terminationStatus == 0 else {
+            throw CorpusError.externalConversionFailed(
+                destination: destination.lastPathComponent,
+                message: errorText
+            )
+        }
+    }
+
     private func describe(_ result: RunResult) -> String {
         guard let features = result.features else {
             return "status=\(result.analysisStatus), no features"
@@ -523,6 +703,66 @@ struct BitCheckTests {
 
     private enum CorpusError: Error {
         case conversionFailed(source: String, destination: String, message: String)
+        case externalConversionFailed(destination: String, message: String)
         case cannotEnumerate(String)
+    }
+}
+
+private final class AnalysisConcurrencyRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let delay: TimeInterval
+    private let observesCancellation: Bool
+    private var activeCount = 0
+    private var recordedMaximum = 0
+    private var recordedStartedCount = 0
+
+    init(delay: TimeInterval, observesCancellation: Bool = false) {
+        self.delay = delay
+        self.observesCancellation = observesCancellation
+    }
+
+    var maximumConcurrent: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedMaximum
+    }
+
+    var startedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedStartedCount
+    }
+
+    func analyse(_ file: URL) -> RunResult {
+        lock.lock()
+        activeCount += 1
+        recordedStartedCount += 1
+        recordedMaximum = max(recordedMaximum, activeCount)
+        lock.unlock()
+
+        defer {
+            lock.lock()
+            activeCount -= 1
+            lock.unlock()
+        }
+
+        let deadline = Date().addingTimeInterval(delay)
+        while Date() < deadline {
+            if observesCancellation, Task.isCancelled { break }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+
+        return RunResult(
+            success: true,
+            actualBitrate: "128 kbps",
+            frequency: "16 kHz (16.0 kHz)",
+            confidence: "80%",
+            analysisStatus: "Likely lossy (128 kbps)",
+            reportedBitrate: "320 kbps",
+            bitrateMode: "CBR",
+            features: nil,
+            cutoffHz: 16_000,
+            verdict: .lossyAsExpected(estimatedSource: "128 kbps")
+        )
     }
 }

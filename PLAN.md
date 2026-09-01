@@ -50,7 +50,9 @@ The work is deliberately staged. Repository accuracy, testability, correctness, 
 - Nearest-tier granular bitrate output for every valid cutoff, with continuous distance-weighted confidence instead of unlabelled gaps between reference ranges
 - Explicit verdict classes for likely authentic, likely transcoded, lossy as expected, technically defective, and inconclusive results
 - Runtime-generated native AAC, ALAC, FLAC, and AAC-to-ALAC corpus cases derived from a known deterministic broadband source
-- An opt-in, read-only external-corpus evaluator plus a memory-bounded full-stream evidence pass for decode errors, frame shortfall, sample clipping, peak level, and long silence
+- A read-only external-corpus evaluator plus a default-on, user-controllable, memory-bounded full-stream pass for decode errors, frame shortfall, sample clipping, peak level, and long silence
+- Bounded concurrent batch analysis with progress, cancellation, stable incremental row updates, and per-file failure isolation
+- Per-window temporal cutoff percentiles, spread, and shelf-persistence evidence retained for encoder- and mode-specific modelling
 
 Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULATIONS.md`. They remain subject to corpus validation and replacement by codec-appropriate bandwidth models. The implementation treats these as absolute decoded bandwidths rather than scaling them with output sample rate.
 
@@ -64,7 +66,7 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 ### Verification status
 
 - The application builds successfully with the current Xcode toolchain.
-- The focused unit suite executes successfully: 15 tests covering the current foundation contracts, native codec corpus, granular tier mapping, and full-stream clipping/silence evidence.
+- The focused unit suite executes successfully: 20 tests covering the current foundation contracts, native and externally encoded codec corpora, granular tier mapping, temporal evidence, full-stream technical evidence, bounded concurrency, and cancellation.
 - The unit-test target now contains deterministic coverage for codec routing, absolute bandwidth mapping, independent training labels, distributed window selection, all-channel analysis, cutoff fusion, generated PCM metadata, native AAC/ALAC/FLAC encoding and transcoding, verdicts, confidence caps, stable result identity, and technical-quality measurements. The UI-test target remains template-only.
 - A read-only external corpus currently contributes 137 tracks: 56 filename-labelled bitrate mismatches, 39 composite technical-defect labels, and 42 unlabelled tracks. These are useful silver labels, not independent ground truth; the unlabelled group is excluded from scoring because it may include material added after the reference scan.
 - The original gap-based mapping matched 14 of 56 precise bitrate labels. Reclassifying the retained cutoffs by the nearest granular tier maps 37 of 56 to the same tier, but performance remains highly uneven by label and is not a held-out result.
@@ -87,10 +89,9 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 ### Performance and resilience
 
 - Folder discovery and metadata inspection can block the main actor.
-- Batch analysis is sequential and has no cancellation path.
-- Result arrays are repeatedly replaced during a run, although file-based result identity is now stable.
+- Batch analysis is bounded to at most four concurrent files and supports cancellation, but it does not yet persist interrupted queue state across application launches.
 - Spectrogram rendering reads the complete file and creates two duration-proportional images, causing unbounded memory growth.
-- The normal result path still samples rather than decoding every frame. A full-stream evidence seam now records read errors, duration shortfall, clipped-sample ratio, peak amplitude, and longest silence, but it is not yet integrated because the extra pass needs cancellation, concurrency, and independently justified defect thresholds.
+- Full-stream technical checks now participate in the normal result path by default and can be disabled from the Analysis menu. Read errors and material duration shortfalls can override the verdict; clipping and silence remain raw measurements until independent thresholds exist.
 
 ### Product and project consistency
 
@@ -119,6 +120,7 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 - [x] Add focused cutoff-fusion, metadata extraction, confidence, and verdict tests
 - [x] Add runtime-generated native AAC, ALAC, FLAC, and AAC-to-ALAC cases from a deterministic known source
 - [x] Add an opt-in read-only external filename-labelled corpus evaluator
+- [x] Add test-only runtime-generated LAME MP3 and Opus CBR/VBR cases when the external encoders are available
 - [ ] Expand independently generated fixtures across MP3, AAC-LC, HE-AAC, Opus, WAV, AIFF, encoder modes, and additional lossless transcodes
 - [ ] Cover CBR, ABR, VBR, encoder-defined low-pass settings, mono/stereo, bit depth, and common sample rates
 - [x] Create initial independently labelled genuine-lossless and AAC-to-lossless transcode material from a deterministic known source
@@ -140,17 +142,17 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 
 ### Stage 3 — Batch performance and spectrogram resilience
 
-- [ ] Move file discovery and metadata reads off the main actor
-- [ ] Add bounded task-group concurrency appropriate to Apple silicon
-- [ ] Add progress, cancellation, and per-file failure isolation
-- [ ] Update individual results without replacing stable collection identity
+- [x] Move file discovery and metadata reads off the main actor
+- [x] Add bounded task-group concurrency appropriate to Apple silicon
+- [x] Add progress, cancellation, and per-file failure isolation
+- [x] Update individual results without replacing stable collection identity
 - [ ] Bound spectrogram width and aggregate FFT frames into display columns
 - [ ] Avoid retaining duplicate full-resolution intensity and pixel buffers
 - [ ] Benchmark large folders, long recordings, and high-sample-rate material
 
 ### Stage 4 — Native macOS workflow
 
-- [x] Move Add Files, Add Folder, Clear, and Run into a native toolbar; cancellation remains pending
+- [x] Move Add Files, Add Folder, Clear, Run, and Cancel into a native toolbar workflow
 - [x] Move training controls into a secondary toolbar menu
 - [x] Simplify the main table to the most decision-relevant columns
 - [ ] Add a detail inspector for codec metadata, evidence, confidence, and spectrogram access
@@ -165,7 +167,7 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 - [ ] Detect HE-AAC/SBR and other bandwidth-extension patterns
 - [ ] Detect resampling and sample-rate upconversion evidence
 - [ ] Model encoder- and mode-specific artefacts beyond a single cutoff frequency
-- [ ] Add temporal cutoff and bandwidth-distribution analysis across complete tracks
+- [x] Preserve per-window cutoff percentiles, spread, and shelf persistence across distributed regions
 - [ ] Detect clipping and sustained inter-sample peak risk where practical
 - [ ] Validate declared duration against decoded frame duration
 - [ ] Detect truncated, malformed, unreadable, and internally inconsistent streams

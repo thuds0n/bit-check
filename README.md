@@ -19,8 +19,9 @@ xcodebuild -scheme BitCheck -destination 'platform=macOS' build | xcbeautify
 Once running:
 
 - Drag audio files or folders onto the drop area, or use **Add Files** and **Add Folder** in the toolbar.
-- Select **Run** to analyse the queue.
-- Review the estimated source, detected cutoff, confidence, and verdict.
+- Select **Run** to analyse the queue. Bit Check processes a bounded number of files concurrently and shows progress; select **Cancel** to stop scheduling further work.
+- Review the estimated source, detected cutoff, confidence, verdict, and technical evidence.
+- Full-stream technical checks are enabled by default and can be disabled from the **Analysis** menu for a quicker spectral-only pass.
 - Control-click a result to reveal the file in Finder or open its spectrogram.
 
 Supported formats: MP3, FLAC, WAV, AAC (M4A), AIFF, ALAC, OGG, Opus
@@ -45,7 +46,8 @@ Short version:
 2. Analyse every decoded channel with 8192-sample Hann windows and 50% overlap.
 3. Average squared FFT magnitudes in the power domain using Welch's method.
 4. Fuse gradient, cumulative-energy, and noise-floor cutoff estimates.
-5. Combine shelf sharpness, temporal and channel stability, high-band energy, spectral flatness, method agreement, and sample support.
+5. Retain per-window cutoff percentiles, bandwidth spread, shelf persistence, temporal/channel stability, high-band energy, spectral flatness, method agreement, and sample support.
 6. Map the absolute detected bandwidth through provisional codec-specific source-bitrate ranges.
+7. When enabled, decode the complete stream in bounded chunks to detect read failures and measure duration shortfall, sample clipping, peak amplitude, and long silence.
 
 See `CALCULATIONS.md` for the current formulas, cutoff tables, confidence model, and limitations.

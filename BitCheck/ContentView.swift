@@ -57,6 +57,15 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if viewModel.isRunning, viewModel.totalCount > 0 {
+                ProgressView(
+                    value: Double(viewModel.completedCount),
+                    total: Double(viewModel.totalCount)
+                )
+                .accessibilityLabel("Analysis progress")
+                .accessibilityValue("\(viewModel.completedCount) of \(viewModel.totalCount) files")
+            }
+
             Table(sortedResults, selection: $selection, sortOrder: $sortOrder) {
                 TableColumn("Run", value: \.sortRunState) { item in
                     Image(systemName: item.state.symbolName)
@@ -103,6 +112,12 @@ struct ContentView: View {
                 }
                 .width(min: 170, ideal: 230)
 
+                TableColumn("Technical", value: \.technicalSummary) { item in
+                    Text(item.technicalSummary)
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 145, ideal: 190)
+
             }
             .overlay {
                 if sortedResults.isEmpty {
@@ -132,15 +147,17 @@ struct ContentView: View {
                 Button("Add Files", systemImage: "plus") {
                     viewModel.pickFiles()
                 }
+                .disabled(viewModel.isRunning || viewModel.isImporting)
 
                 Button("Add Folder", systemImage: "folder.badge.plus") {
                     viewModel.pickFolder()
                 }
+                .disabled(viewModel.isRunning || viewModel.isImporting)
 
                 Button("Clear", systemImage: "trash") {
                     viewModel.clearQueue()
                 }
-                .disabled(viewModel.queuedFiles.isEmpty || viewModel.isRunning)
+                .disabled(viewModel.queuedFiles.isEmpty || viewModel.isRunning || viewModel.isImporting)
 
                 Menu("Training", systemImage: "wrench.and.screwdriver") {
                     Toggle("Training Mode", isOn: $viewModel.trainingModeEnabled)
@@ -150,13 +167,22 @@ struct ContentView: View {
                     .disabled(viewModel.trainingSamples.isEmpty || viewModel.isRunning)
                 }
 
-                Button(viewModel.isRunning ? "Running…" : "Run", systemImage: "play.fill") {
-                    Task {
-                        await viewModel.validateQueuedFiles()
-                    }
+                Menu("Analysis", systemImage: "waveform.path.ecg") {
+                    Toggle("Full-stream technical checks", isOn: $viewModel.deepAnalysisEnabled)
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(viewModel.queuedFiles.isEmpty || viewModel.isRunning)
+                .disabled(viewModel.isRunning)
+
+                if viewModel.isRunning {
+                    Button("Cancel", systemImage: "stop.fill", role: .cancel) {
+                        viewModel.cancelValidation()
+                    }
+                } else {
+                    Button("Run", systemImage: "play.fill") {
+                        viewModel.startValidation()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(viewModel.queuedFiles.isEmpty || viewModel.isImporting)
+                }
             }
         }
     }
@@ -705,13 +731,38 @@ final class ValidationViewModel: ObservableObject {
     @Published var queuedFiles: [URL] = []
     @Published var results: [ValidationResult] = []
     @Published var isRunning = false
+    @Published private(set) var isImporting = false
     @Published var statusMessage = ""
+    @Published private(set) var completedCount = 0
+    @Published private(set) var totalCount = 0
+    @Published var deepAnalysisEnabled = true
     @Published var trainingModeEnabled = false
     @Published private(set) var trainingSamples: [TrainingSample] = []
+
+    private let maxConcurrentAnalyses: Int
+    private let analysisOperation: @Sendable (URL, Bool) -> RunResult
+    private var validationTask: Task<Void, Never>?
 
     private let supportedAudioExtensions: Set<String> = [
         "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "aiff", "aif", "alac"
     ]
+
+    init(
+        maxConcurrentAnalyses: Int = ValidationViewModel.defaultConcurrencyLimit,
+        analysisOperation: @escaping @Sendable (URL, Bool) -> RunResult = { file, includeTechnicalEvidence in
+            NativeTrueBitrateAnalyzer.analyze(
+                file: file,
+                includeTechnicalEvidence: includeTechnicalEvidence
+            )
+        }
+    ) {
+        self.maxConcurrentAnalyses = max(1, maxConcurrentAnalyses)
+        self.analysisOperation = analysisOperation
+    }
+
+    nonisolated static var defaultConcurrencyLimit: Int {
+        min(4, max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
+    }
 
     func pickFiles() {
         let panel = NSOpenPanel()
@@ -735,20 +786,14 @@ final class ValidationViewModel: ObservableObject {
     }
 
     func handleDrop(providers: [NSItemProvider]) {
-        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-            provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { [weak self] data, _ in
-                guard
-                    let self,
-                    let data,
-                    let url = NSURL(absoluteURLWithDataRepresentation: data, relativeTo: nil) as URL?
-                else {
-                    return
-                }
-
-                Task { @MainActor in
-                    self.enqueue(urls: [url])
+        Task { [weak self] in
+            var urls: [URL] = []
+            for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                if let url = await Self.droppedURL(from: provider) {
+                    urls.append(url)
                 }
             }
+            self?.enqueue(urls: urls)
         }
     }
 
@@ -756,21 +801,43 @@ final class ValidationViewModel: ObservableObject {
         queuedFiles.removeAll()
         results.removeAll()
         trainingSamples.removeAll()
+        completedCount = 0
+        totalCount = 0
         statusMessage = ""
     }
 
+    func startValidation() {
+        guard validationTask == nil, !queuedFiles.isEmpty, !isImporting else { return }
+        validationTask = Task { [weak self] in
+            await self?.validateQueuedFiles()
+        }
+    }
+
+    func cancelValidation() {
+        guard let validationTask else { return }
+        statusMessage = "Cancelling analysis…"
+        validationTask.cancel()
+    }
+
     func validateQueuedFiles() async {
-        guard !queuedFiles.isEmpty else { return }
+        guard !queuedFiles.isEmpty, !isRunning else { return }
 
         isRunning = true
-        defer { isRunning = false }
+        defer {
+            isRunning = false
+            validationTask = nil
+        }
 
-        statusMessage = "Validating \(queuedFiles.count) file(s)..."
+        let files = queuedFiles
+        let includeTechnicalEvidence = deepAnalysisEnabled
+        completedCount = 0
+        totalCount = files.count
+        statusMessage = "Analysing 0 of \(files.count) files…"
         if trainingModeEnabled {
             trainingSamples.removeAll()
         }
 
-        var updatedResults = queuedFiles.map {
+        results = files.map {
             let existing = existingOrDefaultResult(for: $0)
             return ValidationResult(
                 fileURL: $0,
@@ -786,34 +853,95 @@ final class ValidationViewModel: ObservableObject {
             )
         }
 
-        for index in updatedResults.indices {
-            updatedResults[index].state = .running
-            updatedResults[index].analysisStatus = "Analysing"
-            results = updatedResults
+        await withTaskGroup(of: BatchAnalysisOutput.self) { group in
+            var nextFileIndex = 0
 
-            let file = updatedResults[index].fileURL
-            let result = await runTrueBitrate(for: file)
+            while nextFileIndex < min(maxConcurrentAnalyses, files.count) {
+                let file = files[nextFileIndex]
+                nextFileIndex += 1
+                markRunning(file: file)
+                let operation = analysisOperation
+                group.addTask(priority: .userInitiated) {
+                    BatchAnalysisOutput(
+                        file: file,
+                        result: operation(file, includeTechnicalEvidence)
+                    )
+                }
+            }
 
-            updatedResults[index].state = result.success ? .done : .failed
-            updatedResults[index].actualBitrate = result.actualBitrate
-            updatedResults[index].frequency = result.frequency
-            updatedResults[index].confidence = result.confidence
-            updatedResults[index].analysisStatus = result.analysisStatus
-            updatedResults[index].reportedBitrate = result.reportedBitrate
-            updatedResults[index].bitrateMode = result.bitrateMode
-            updatedResults[index].cutoffHz = result.cutoffHz
-            results = updatedResults
+            while let output = await group.next() {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    continue
+                }
 
-            if trainingModeEnabled {
-                let expectation = TrainingLabelParser.parse(
-                    fileName: file.deletingPathExtension().lastPathComponent,
-                    reportedBitrate: result.reportedBitrate
-                )
-                let predictedLabel = TrainingLabelParser.normalize(result.actualBitrate)
-                let isMatch = expectation.isTrainable ? expectation.label == predictedLabel : nil
-                let sample = TrainingSample(
-                    fileURL: file,
-                    fileType: updatedResults[index].fileType,
+                apply(output)
+                completedCount += 1
+                statusMessage = "Analysing \(completedCount) of \(files.count) files…"
+
+                if nextFileIndex < files.count {
+                    let file = files[nextFileIndex]
+                    nextFileIndex += 1
+                    markRunning(file: file)
+                    let operation = analysisOperation
+                    group.addTask(priority: .userInitiated) {
+                        BatchAnalysisOutput(
+                            file: file,
+                            result: operation(file, includeTechnicalEvidence)
+                        )
+                    }
+                }
+            }
+        }
+
+        if Task.isCancelled {
+            markUnfinishedAsCancelled()
+            statusMessage = "Analysis cancelled after \(completedCount) of \(files.count) files."
+            return
+        }
+
+        let failedCount = results.filter { $0.state == .failed }.count
+        if failedCount == 0 {
+            statusMessage = "Validation completed for \(results.count) file(s)."
+        } else {
+            statusMessage = "Validation completed with \(failedCount) failure(s)."
+        }
+        if trainingModeEnabled {
+            let trainableCount = trainingSamples.filter(\.isTrainable).count
+            statusMessage += " Training rows: \(trainingSamples.count) (\(trainableCount) trainable)."
+        }
+    }
+
+    private func markRunning(file: URL) {
+        guard let index = results.firstIndex(where: { $0.fileURL == file }) else { return }
+        results[index].state = .running
+        results[index].analysisStatus = "Analysing"
+    }
+
+    private func apply(_ output: BatchAnalysisOutput) {
+        guard let index = results.firstIndex(where: { $0.fileURL == output.file }) else { return }
+        let result = output.result
+        results[index].state = result.success ? .done : .failed
+        results[index].actualBitrate = result.actualBitrate
+        results[index].frequency = result.frequency
+        results[index].confidence = result.confidence
+        results[index].analysisStatus = result.analysisStatus
+        results[index].reportedBitrate = result.reportedBitrate
+        results[index].bitrateMode = result.bitrateMode
+        results[index].cutoffHz = result.cutoffHz
+        results[index].technicalSummary = result.technicalEvidence?.summary ?? "Not checked"
+
+        if trainingModeEnabled {
+            let expectation = TrainingLabelParser.parse(
+                fileName: output.file.deletingPathExtension().lastPathComponent,
+                reportedBitrate: result.reportedBitrate
+            )
+            let predictedLabel = TrainingLabelParser.normalize(result.actualBitrate)
+            let isMatch = expectation.isTrainable ? expectation.label == predictedLabel : nil
+            trainingSamples.append(
+                TrainingSample(
+                    fileURL: output.file,
+                    fileType: results[index].fileType,
                     reportedBitrate: result.reportedBitrate,
                     predictedBitrate: result.actualBitrate,
                     confidenceText: result.confidence,
@@ -822,21 +950,17 @@ final class ValidationViewModel: ObservableObject {
                     expectationType: expectation.type,
                     isTrainable: expectation.isTrainable,
                     isMatch: isMatch,
-                    features: result.features
+                    features: result.features,
+                    technicalEvidence: result.technicalEvidence
                 )
-                trainingSamples.append(sample)
-            }
+            )
         }
+    }
 
-        let failedCount = updatedResults.filter { $0.state == .failed }.count
-        if failedCount == 0 {
-            statusMessage = "Validation completed for \(updatedResults.count) file(s)."
-        } else {
-            statusMessage = "Validation completed with \(failedCount) failure(s)."
-        }
-        if trainingModeEnabled {
-            let trainableCount = trainingSamples.filter(\.isTrainable).count
-            statusMessage += " Training rows: \(trainingSamples.count) (\(trainableCount) trainable)."
+    private func markUnfinishedAsCancelled() {
+        for index in results.indices where results[index].state == .pending || results[index].state == .running {
+            results[index].state = .cancelled
+            results[index].analysisStatus = "Cancelled"
         }
     }
 
@@ -865,16 +989,37 @@ final class ValidationViewModel: ObservableObject {
     }
 
     private func enqueue(urls: [URL]) {
-        let files = urls.flatMap { collectAudioFiles(from: $0) }
-        guard !files.isEmpty else {
-            statusMessage = "No supported audio files found."
-            return
-        }
+        guard !urls.isEmpty, !isRunning, !isImporting else { return }
+        isImporting = true
+        statusMessage = "Discovering audio files…"
+        let supportedExtensions = supportedAudioExtensions
 
-        let merged = Set(queuedFiles).union(files)
-        queuedFiles = merged.sorted { $0.path < $1.path }
-        results = queuedFiles.map { existingOrDefaultResult(for: $0) }
-        statusMessage = "Queued \(queuedFiles.count) file(s)."
+        Task { [weak self] in
+            let candidates = await Task.detached(priority: .userInitiated) {
+                Self.importCandidates(from: urls, supportedExtensions: supportedExtensions)
+            }.value
+            guard let self else { return }
+            defer { isImporting = false }
+
+            guard !candidates.isEmpty else {
+                statusMessage = "No supported audio files found."
+                return
+            }
+
+            let existingByURL = Dictionary(uniqueKeysWithValues: results.map { ($0.fileURL, $0) })
+            let candidateByURL = Dictionary(uniqueKeysWithValues: candidates.map { ($0.fileURL, $0) })
+            queuedFiles = Set(queuedFiles).union(candidateByURL.keys).sorted { $0.path < $1.path }
+            results = queuedFiles.map { file in
+                if let existing = existingByURL[file] {
+                    return existing
+                }
+                guard let candidate = candidateByURL[file] else {
+                    return self.existingOrDefaultResult(for: file)
+                }
+                return self.defaultResult(for: file, metadata: candidate.metadata)
+            }
+            statusMessage = "Queued \(queuedFiles.count) file(s)."
+        }
     }
 
     private func existingOrDefaultResult(for file: URL) -> ValidationResult {
@@ -882,7 +1027,11 @@ final class ValidationViewModel: ObservableObject {
             return existing
         }
         let metadata = metadata(for: file)
-        return ValidationResult(
+        return defaultResult(for: file, metadata: metadata)
+    }
+
+    private func defaultResult(for file: URL, metadata: FileMetadata) -> ValidationResult {
+        ValidationResult(
             fileURL: file,
             actualBitrate: "—",
             frequency: "—",
@@ -896,45 +1045,56 @@ final class ValidationViewModel: ObservableObject {
         )
     }
 
-    private func collectAudioFiles(from url: URL) -> [URL] {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
-            return []
-        }
-
-        if !isDirectory.boolValue {
-            return isSupportedAudioFile(url) ? [url] : []
-        }
-
-        guard let enumerator = FileManager.default.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        var files: [URL] = []
-        for case let fileURL as URL in enumerator {
-            if isSupportedAudioFile(fileURL) {
-                files.append(fileURL)
+    nonisolated private static func importCandidates(
+        from urls: [URL],
+        supportedExtensions: Set<String>
+    ) -> [QueuedFileCandidate] {
+        let files = urls.flatMap { url -> [URL] in
+            guard !Task.isCancelled else { return [] }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                return []
             }
+            if !isDirectory.boolValue {
+                return supportedExtensions.contains(url.pathExtension.lowercased()) ? [url] : []
+            }
+            guard let enumerator = FileManager.default.enumerator(
+                at: url,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                return []
+            }
+            var discovered: [URL] = []
+            for case let fileURL as URL in enumerator {
+                guard !Task.isCancelled else { break }
+                if supportedExtensions.contains(fileURL.pathExtension.lowercased()) {
+                    discovered.append(fileURL)
+                }
+            }
+            return discovered
         }
-        return files
-    }
-
-    private func isSupportedAudioFile(_ url: URL) -> Bool {
-        supportedAudioExtensions.contains(url.pathExtension.lowercased())
+        return Array(Set(files)).map { file in
+            QueuedFileCandidate(fileURL: file, metadata: NativeTrueBitrateAnalyzer.inspect(file: file))
+        }
     }
 
     private func metadata(for file: URL) -> FileMetadata {
         NativeTrueBitrateAnalyzer.inspect(file: file)
     }
 
-    private func runTrueBitrate(for file: URL) async -> RunResult {
-        await Task.detached(priority: .userInitiated) {
-            NativeTrueBitrateAnalyzer.analyze(file: file)
-        }.value
+    nonisolated private static func droppedURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+                guard let data else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(
+                    returning: NSURL(absoluteURLWithDataRepresentation: data, relativeTo: nil) as URL?
+                )
+            }
+        }
     }
 
     func openInFinder(url: URL) {
@@ -986,6 +1146,11 @@ final class ValidationViewModel: ObservableObject {
             "cutoff_spread_khz",
             "cutoff_mean_deviation_khz",
             "cutoff_agreement",
+            "temporal_cutoff_p10_khz",
+            "temporal_cutoff_median_khz",
+            "temporal_cutoff_p90_khz",
+            "temporal_cutoff_spread_khz",
+            "temporal_shelf_persistence",
             "cutoff_ratio",
             "drop_score",
             "stability",
@@ -994,7 +1159,17 @@ final class ValidationViewModel: ObservableObject {
             "evidence_confidence",
             "classification_confidence",
             "model_confidence",
-            "final_confidence"
+            "final_confidence",
+            "integrity_defective",
+            "declared_frames",
+            "decoded_frames",
+            "shortfall_seconds",
+            "shortfall_ratio",
+            "integrity_read_error",
+            "clipped_samples",
+            "clipping_ratio",
+            "peak_amplitude",
+            "longest_silence_seconds"
         ]
         var lines = [header.map(Self.csvEscape).joined(separator: ",")]
         for sample in trainingSamples {
@@ -1018,6 +1193,11 @@ final class ValidationViewModel: ObservableObject {
             row.append(features?.cutoffSpreadKHzText ?? "")
             row.append(features?.cutoffMeanDeviationKHzText ?? "")
             row.append(features?.cutoffAgreementText ?? "")
+            row.append(features?.temporalCutoffP10KHzText ?? "")
+            row.append(features?.temporalCutoffMedianKHzText ?? "")
+            row.append(features?.temporalCutoffP90KHzText ?? "")
+            row.append(features?.temporalCutoffSpreadKHzText ?? "")
+            row.append(features?.temporalShelfPersistenceText ?? "")
             row.append(features?.cutoffRatioText ?? "")
             row.append(features?.dropScoreText ?? "")
             row.append(features?.stabilityText ?? "")
@@ -1027,6 +1207,17 @@ final class ValidationViewModel: ObservableObject {
             row.append(features?.classificationConfidenceText ?? "")
             row.append(features?.modelConfidenceText ?? "")
             row.append(features?.finalConfidenceText ?? "")
+            let technical = sample.technicalEvidence
+            row.append(technical.map { $0.isTechnicallyDefective ? "true" : "false" } ?? "")
+            row.append(technical.map { String($0.declaredFrames) } ?? "")
+            row.append(technical.map { String($0.decodedFrames) } ?? "")
+            row.append(technical.map { String(format: "%.6f", $0.shortfallSeconds) } ?? "")
+            row.append(technical.map { String(format: "%.6f", $0.shortfallRatio) } ?? "")
+            row.append(technical?.readError ?? "")
+            row.append(technical.map { String($0.clippedSamples) } ?? "")
+            row.append(technical.map { String(format: "%.9f", $0.clippingRatio) } ?? "")
+            row.append(technical.map { String(format: "%.6f", $0.peakAmplitude) } ?? "")
+            row.append(technical.map { String(format: "%.6f", $0.longestSilenceSeconds) } ?? "")
             lines.append(row.map(Self.csvEscape).joined(separator: ","))
         }
         return lines.joined(separator: "\n")
@@ -1103,6 +1294,10 @@ nonisolated enum NativeTrueBitrateAnalyzer {
             var readError: String?
 
             while declaredFrames == 0 || decodedFrames < declaredFrames {
+                if Task.isCancelled {
+                    readError = "Cancelled"
+                    break
+                }
                 let requestedFrames: AVAudioFrameCount
                 if declaredFrames == 0 {
                     requestedFrames = chunkFrames
@@ -1191,8 +1386,9 @@ nonisolated enum NativeTrueBitrateAnalyzer {
         }
     }
 
-    static func analyze(file: URL) -> RunResult {
+    static func analyze(file: URL, includeTechnicalEvidence: Bool = false) -> RunResult {
         do {
+            try Task.checkCancellation()
             let samples = try loadSamples(from: file, maxSeconds: 30)
             guard samples.regionRanges.contains(where: { $0.count >= samplesPerWindow(samples.sampleRate) }) else {
                 return RunResult(
@@ -1210,17 +1406,41 @@ nonisolated enum NativeTrueBitrateAnalyzer {
             }
 
             let estimate = try estimateBitrate(from: samples)
+            let technicalEvidence = includeTechnicalEvidence ? inspectStreamIntegrity(file: file) : nil
+            try Task.checkCancellation()
+            let verdict: AnalysisVerdict
+            if let technicalEvidence, technicalEvidence.isTechnicallyDefective {
+                verdict = .technicallyDefective(
+                    reason: technicalEvidence.defectReason ?? "stream integrity failure"
+                )
+            } else {
+                verdict = estimate.verdict
+            }
             return RunResult(
                 success: true,
                 actualBitrate: estimate.actualBitrate,
                 frequency: estimate.frequency,
                 confidence: estimate.confidenceText,
-                analysisStatus: estimate.status,
+                analysisStatus: verdict.label,
                 reportedBitrate: samples.reportedBitrate,
                 bitrateMode: samples.bitrateMode,
                 features: estimate.features,
                 cutoffHz: estimate.cutoffHz,
-                verdict: estimate.verdict
+                verdict: verdict,
+                technicalEvidence: technicalEvidence
+            )
+        } catch is CancellationError {
+            return RunResult(
+                success: false,
+                actualBitrate: "N/A",
+                frequency: "N/A",
+                confidence: "0%",
+                analysisStatus: "Cancelled",
+                reportedBitrate: "N/A",
+                bitrateMode: "Unknown",
+                features: nil,
+                cutoffHz: nil,
+                verdict: nil
             )
         } catch {
             return RunResult(
@@ -1239,6 +1459,7 @@ nonisolated enum NativeTrueBitrateAnalyzer {
     }
 
     private static func loadSamples(from fileURL: URL, maxSeconds: Int) throws -> AudioSamples {
+        try Task.checkCancellation()
         let file = try AVAudioFile(forReading: fileURL)
         let format = file.processingFormat
         let sampleRate = Int(format.sampleRate.rounded())
@@ -1259,6 +1480,7 @@ nonisolated enum NativeTrueBitrateAnalyzer {
         var regionRanges: [Range<Int>] = []
 
         for regionIndex in 0..<regionCount {
+            try Task.checkCancellation()
             let regionLength = baseRegionLength + (regionIndex == regionCount - 1 ? remainder : 0)
             guard regionLength > 0 else { continue }
             let startFrame: AVAudioFramePosition
@@ -1424,6 +1646,7 @@ nonisolated enum NativeTrueBitrateAnalyzer {
     private static let analysisHopFraction = 0.5 // 50% overlap
 
     static func estimateBitrate(from audio: AudioSamples) throws -> BitrateEstimate {
+        try Task.checkCancellation()
         let sampleRate = audio.sampleRate
         let fftLength = analysisFFTLength
         let hopLength = Int(Double(fftLength) * analysisHopFraction)
@@ -1454,10 +1677,11 @@ nonisolated enum NativeTrueBitrateAnalyzer {
         var imag = [Float](repeating: 0, count: freqBins)
         var magnitudes = [Float](repeating: 0, count: freqBins)
         var power = [Float](repeating: 0, count: freqBins)
-        var segmentCutoffRatios: [Double] = []
+        var segmentCutoffsHz: [Double] = []
 
         var transformCount = 0
         for start in segmentStarts {
+            try Task.checkCancellation()
             let end = start + fftLength
             for channel in audio.channels {
                 guard end <= channel.count else { continue }
@@ -1488,7 +1712,7 @@ nonisolated enum NativeTrueBitrateAnalyzer {
                 let localDb = power.map { 10.0 * log10f(max($0, 1.0e-24)) }
                 let localSmoothed = movingAverage(localDb, window: max(3, freqBins / 80))
                 let localCutoff = cutoffGradient(spectrum: localSmoothed, frequencyResolution: frequencyResolution)
-                segmentCutoffRatios.append(localCutoff / nyquistHz)
+                segmentCutoffsHz.append(localCutoff)
             }
         }
 
@@ -1522,7 +1746,12 @@ nonisolated enum NativeTrueBitrateAnalyzer {
         let subBandResult = subBandAnalysis(powerSpectrum: averagedPower, sampleRate: sampleRate, freqBins: freqBins)
 
         // --- Stability ---
+        let segmentCutoffRatios = segmentCutoffsHz.map { $0 / nyquistHz }
         let stability = stabilityScore(segmentCutoffRatios)
+        let temporalCutoffEvidence = temporalCutoffEvidence(
+            segmentCutoffsHz: segmentCutoffsHz,
+            referenceCutoffHz: fusedCutoffHz
+        )
         let sampleSupport = normalized(value: Double(segmentStarts.count), minValue: 6, maxValue: 60)
 
         // --- Lossless discrimination (multi-feature) ---
@@ -1606,8 +1835,55 @@ nonisolated enum NativeTrueBitrateAnalyzer {
             classificationConfidence: classification.score,
             confidence: confidence,
             isLosslessContainer: profile == .lossless,
-            cutoffEvidence: cutoffEvidence
+            cutoffEvidence: cutoffEvidence,
+            temporalCutoffEvidence: temporalCutoffEvidence
         )
+    }
+
+    static func temporalCutoffEvidence(
+        segmentCutoffsHz: [Double],
+        referenceCutoffHz: Double
+    ) -> TemporalCutoffEvidence {
+        let sorted = segmentCutoffsHz.filter(\.isFinite).sorted()
+        guard !sorted.isEmpty else {
+            return TemporalCutoffEvidence(
+                sampleCount: 0,
+                lowerPercentileHz: 0,
+                medianHz: 0,
+                upperPercentileHz: 0,
+                percentileSpreadHz: 0,
+                shelfPersistence: 0
+            )
+        }
+
+        let lower = percentile(sorted, fraction: 0.10)
+        let median = percentile(sorted, fraction: 0.50)
+        let upper = percentile(sorted, fraction: 0.90)
+        let persistentCount = sorted.reduce(into: 0) { count, cutoff in
+            if abs(cutoff - referenceCutoffHz) <= 1_000 {
+                count += 1
+            }
+        }
+        return TemporalCutoffEvidence(
+            sampleCount: sorted.count,
+            lowerPercentileHz: lower,
+            medianHz: median,
+            upperPercentileHz: upper,
+            percentileSpreadHz: max(0, upper - lower),
+            shelfPersistence: Double(persistentCount) / Double(sorted.count)
+        )
+    }
+
+    private static func percentile(_ sortedValues: [Double], fraction: Double) -> Double {
+        guard let first = sortedValues.first else { return 0 }
+        guard sortedValues.count > 1 else { return first }
+        let position = max(0, min(1, fraction)) * Double(sortedValues.count - 1)
+        let lowerIndex = Int(position.rounded(.down))
+        let upperIndex = Int(position.rounded(.up))
+        guard lowerIndex != upperIndex else { return sortedValues[lowerIndex] }
+        let interpolation = position - Double(lowerIndex)
+        return sortedValues[lowerIndex]
+            + interpolation * (sortedValues[upperIndex] - sortedValues[lowerIndex])
     }
 
     static func analysisWindowStarts(
@@ -1888,7 +2164,16 @@ nonisolated struct CutoffEvidence: Equatable {
     let agreement: Double
 }
 
-nonisolated struct FileMetadata {
+nonisolated struct TemporalCutoffEvidence: Equatable, Sendable {
+    let sampleCount: Int
+    let lowerPercentileHz: Double
+    let medianHz: Double
+    let upperPercentileHz: Double
+    let percentileSpreadHz: Double
+    let shelfPersistence: Double
+}
+
+nonisolated struct FileMetadata: Sendable {
     let reportedBitrate: String
     let bitrateMode: String
     let codecName: String
@@ -1897,6 +2182,11 @@ nonisolated struct FileMetadata {
     var displayFormat: String {
         codecName == containerName ? codecName : "\(containerName) · \(codecName)"
     }
+}
+
+nonisolated private struct QueuedFileCandidate: Sendable {
+    let fileURL: URL
+    let metadata: FileMetadata
 }
 
 nonisolated enum CodecProfile: Equatable {
@@ -2008,7 +2298,7 @@ nonisolated enum CodecProfile: Equatable {
     }
 }
 
-nonisolated struct StreamIntegrityEvidence: Equatable {
+nonisolated struct StreamIntegrityEvidence: Equatable, Sendable {
     let declaredFrames: AVAudioFramePosition
     let decodedFrames: AVAudioFramePosition
     let sampleRate: Double
@@ -2043,16 +2333,41 @@ nonisolated struct StreamIntegrityEvidence: Equatable {
         return Double(longestSilentFrames) / sampleRate
     }
 
-    /// A full read error is always material. Frame-count shortfalls need to
-    /// exceed both normal codec padding and one second of programme material.
-    var isTechnicallyDefective: Bool {
-        if readError != nil { return true }
+    var defectReason: String? {
+        if let readError {
+            return "stream read failed: \(readError)"
+        }
+        if isDurationTruncated {
+            return String(format: "decoded duration is %.1f seconds short", shortfallSeconds)
+        }
+        return nil
+    }
+
+    var summary: String {
+        if let defectReason {
+            return defectReason
+        }
+        return String(
+            format: "Clip %.3f%% · silence %.1fs",
+            clippingRatio * 100,
+            longestSilenceSeconds
+        )
+    }
+
+    private var isDurationTruncated: Bool {
         guard declaredFrames > 0 else { return false }
         let toleranceFrames = max(
             AVAudioFramePosition(sampleRate.rounded()),
             AVAudioFramePosition((Double(declaredFrames) * 0.005).rounded())
         )
         return missingFrames > toleranceFrames
+    }
+
+    /// A full read error is always material. Frame-count shortfalls need to
+    /// exceed both normal codec padding and one second of programme material.
+    var isTechnicallyDefective: Bool {
+        if readError != nil { return true }
+        return isDurationTruncated
     }
 }
 
@@ -2071,6 +2386,7 @@ nonisolated struct BitrateEstimate {
     /// When this is true and inferredBitrate is not "lossless", the file is a fake lossless.
     let isLosslessContainer: Bool
     let cutoffEvidence: CutoffEvidence
+    let temporalCutoffEvidence: TemporalCutoffEvidence
 
     private var roundedCutoffKHz: Int {
         Int(cutoffHz / 1_000.0)
@@ -2125,6 +2441,11 @@ nonisolated struct BitrateEstimate {
             cutoffSpreadKHz: cutoffEvidence.spreadHz / 1_000.0,
             cutoffMeanDeviationKHz: cutoffEvidence.meanDeviationHz / 1_000.0,
             cutoffAgreement: cutoffEvidence.agreement,
+            temporalCutoffP10KHz: temporalCutoffEvidence.lowerPercentileHz / 1_000.0,
+            temporalCutoffMedianKHz: temporalCutoffEvidence.medianHz / 1_000.0,
+            temporalCutoffP90KHz: temporalCutoffEvidence.upperPercentileHz / 1_000.0,
+            temporalCutoffSpreadKHz: temporalCutoffEvidence.percentileSpreadHz / 1_000.0,
+            temporalShelfPersistence: temporalCutoffEvidence.shelfPersistence,
             cutoffRatio: cutoffRatio,
             dropScore: dropScore,
             stability: stability,
@@ -2159,7 +2480,7 @@ nonisolated struct BitrateEstimate {
     }
 }
 
-nonisolated enum AnalysisVerdict: Equatable {
+nonisolated enum AnalysisVerdict: Equatable, Sendable {
     case likelyAuthentic
     case likelyTranscoded(estimatedSource: String)
     case lossyAsExpected(estimatedSource: String?)
@@ -2208,7 +2529,7 @@ private enum AnalyzerError: LocalizedError {
     }
 }
 
-nonisolated struct RunResult {
+nonisolated struct RunResult: Sendable {
     let success: Bool
     let actualBitrate: String
     let frequency: String
@@ -2219,9 +2540,36 @@ nonisolated struct RunResult {
     let features: AnalysisFeatures?
     let cutoffHz: Double?
     let verdict: AnalysisVerdict?
+    let technicalEvidence: StreamIntegrityEvidence?
+
+    init(
+        success: Bool,
+        actualBitrate: String,
+        frequency: String,
+        confidence: String,
+        analysisStatus: String,
+        reportedBitrate: String,
+        bitrateMode: String,
+        features: AnalysisFeatures?,
+        cutoffHz: Double?,
+        verdict: AnalysisVerdict?,
+        technicalEvidence: StreamIntegrityEvidence? = nil
+    ) {
+        self.success = success
+        self.actualBitrate = actualBitrate
+        self.frequency = frequency
+        self.confidence = confidence
+        self.analysisStatus = analysisStatus
+        self.reportedBitrate = reportedBitrate
+        self.bitrateMode = bitrateMode
+        self.features = features
+        self.cutoffHz = cutoffHz
+        self.verdict = verdict
+        self.technicalEvidence = technicalEvidence
+    }
 }
 
-nonisolated struct AnalysisFeatures {
+nonisolated struct AnalysisFeatures: Sendable {
     let cutoffKHz: Double
     let gradientCutoffKHz: Double
     let energyCutoffKHz: Double
@@ -2229,6 +2577,11 @@ nonisolated struct AnalysisFeatures {
     let cutoffSpreadKHz: Double
     let cutoffMeanDeviationKHz: Double
     let cutoffAgreement: Double
+    let temporalCutoffP10KHz: Double
+    let temporalCutoffMedianKHz: Double
+    let temporalCutoffP90KHz: Double
+    let temporalCutoffSpreadKHz: Double
+    let temporalShelfPersistence: Double
     let cutoffRatio: Double
     let dropScore: Double
     let stability: Double
@@ -2246,6 +2599,11 @@ nonisolated struct AnalysisFeatures {
     var cutoffSpreadKHzText: String { Self.format(cutoffSpreadKHz) }
     var cutoffMeanDeviationKHzText: String { Self.format(cutoffMeanDeviationKHz) }
     var cutoffAgreementText: String { Self.format(cutoffAgreement) }
+    var temporalCutoffP10KHzText: String { Self.format(temporalCutoffP10KHz) }
+    var temporalCutoffMedianKHzText: String { Self.format(temporalCutoffMedianKHz) }
+    var temporalCutoffP90KHzText: String { Self.format(temporalCutoffP90KHz) }
+    var temporalCutoffSpreadKHzText: String { Self.format(temporalCutoffSpreadKHz) }
+    var temporalShelfPersistenceText: String { Self.format(temporalShelfPersistence) }
     var cutoffRatioText: String { Self.format(cutoffRatio) }
     var dropScoreText: String { Self.format(dropScore) }
     var stabilityText: String { Self.format(stability) }
@@ -2261,6 +2619,11 @@ nonisolated struct AnalysisFeatures {
     }
 }
 
+nonisolated struct BatchAnalysisOutput: Sendable {
+    let file: URL
+    let result: RunResult
+}
+
 struct TrainingSample {
     let fileURL: URL
     let fileType: String
@@ -2273,6 +2636,7 @@ struct TrainingSample {
     let isTrainable: Bool
     let isMatch: Bool?
     let features: AnalysisFeatures?
+    let technicalEvidence: StreamIntegrityEvidence?
 }
 
 nonisolated enum TrainingLabelParser {
@@ -2337,6 +2701,7 @@ struct ValidationResult: Identifiable {
     var bitrateMode: String
     var fileType: String
     var cutoffHz: Double?
+    var technicalSummary: String = "—"
 
     var sortFileName: String {
         fileURL.lastPathComponent.lowercased()
@@ -2362,8 +2727,9 @@ struct ValidationResult: Identifiable {
         switch state {
         case .pending: return 0
         case .running: return 1
-        case .done: return 2
-        case .failed: return 3
+        case .cancelled: return 2
+        case .done: return 3
+        case .failed: return 4
         }
     }
 
@@ -2381,7 +2747,7 @@ struct ValidationResult: Identifiable {
     }
 
     private var comparisonOutcome: BitrateComparisonOutcome {
-        if state == .pending || state == .running {
+        if state == .pending || state == .running || state == .cancelled {
             return .unprocessed
         }
 
@@ -2433,6 +2799,7 @@ private enum BitrateComparisonOutcome {
 enum ValidationState {
     case pending
     case running
+    case cancelled
     case done
     case failed
 
@@ -2440,6 +2807,7 @@ enum ValidationState {
         switch self {
         case .pending: return "Pending"
         case .running: return "Running"
+        case .cancelled: return "Cancelled"
         case .done: return "Done"
         case .failed: return "Failed"
         }
@@ -2449,6 +2817,7 @@ enum ValidationState {
         switch self {
         case .pending: return .secondary
         case .running: return .orange
+        case .cancelled: return .secondary
         case .done: return .green
         case .failed: return .red
         }
@@ -2458,6 +2827,7 @@ enum ValidationState {
         switch self {
         case .pending: return "clock.badge.questionmark"
         case .running: return "hourglass.circle"
+        case .cancelled: return "stop.circle"
         case .done: return "checkmark.circle.fill"
         case .failed: return "xmark.circle.fill"
         }
