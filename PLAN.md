@@ -47,8 +47,10 @@ The work is deliberately staged. Repository accuracy, testability, correctness, 
 - Encoded codec inspection separated from filename container extension
 - Five-region sampling for long tracks and all-channel power-domain analysis
 - Per-method cutoff evidence retained through classification and training export
+- Nearest-tier granular bitrate output for every valid cutoff, with continuous distance-weighted confidence instead of unlabelled gaps between reference ranges
 - Explicit verdict classes for likely authentic, likely transcoded, lossy as expected, technically defective, and inconclusive results
 - Runtime-generated native AAC, ALAC, FLAC, and AAC-to-ALAC corpus cases derived from a known deterministic broadband source
+- An opt-in, read-only external-corpus evaluator plus a memory-bounded full-stream evidence pass for decode errors, frame shortfall, sample clipping, peak level, and long silence
 
 Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULATIONS.md`. They remain subject to corpus validation and replacement by codec-appropriate bandwidth models. The implementation treats these as absolute decoded bandwidths rather than scaling them with output sample rate.
 
@@ -62,9 +64,11 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 ### Verification status
 
 - The application builds successfully with the current Xcode toolchain.
-- The focused unit suite executes successfully: 12 tests covering the current foundation contracts and native codec corpus.
-- The unit-test target now contains deterministic coverage for codec routing, absolute bandwidth mapping, independent training labels, distributed window selection, all-channel analysis, cutoff fusion, generated PCM metadata, native AAC/ALAC/FLAC encoding and transcoding, verdicts, confidence caps, and stable result identity. The UI-test target remains template-only.
-- No held-out, multi-encoder labelled corpus currently validates thresholds, feature weights, confidence percentages, or false-positive rates. Runtime-generated fixtures provide regression evidence but are not a calibration set.
+- The focused unit suite executes successfully: 15 tests covering the current foundation contracts, native codec corpus, granular tier mapping, and full-stream clipping/silence evidence.
+- The unit-test target now contains deterministic coverage for codec routing, absolute bandwidth mapping, independent training labels, distributed window selection, all-channel analysis, cutoff fusion, generated PCM metadata, native AAC/ALAC/FLAC encoding and transcoding, verdicts, confidence caps, stable result identity, and technical-quality measurements. The UI-test target remains template-only.
+- A read-only external corpus currently contributes 137 tracks: 56 filename-labelled bitrate mismatches, 39 composite technical-defect labels, and 42 unlabelled tracks. These are useful silver labels, not independent ground truth; the unlabelled group is excluded from scoring because it may include material added after the reference scan.
+- The original gap-based mapping matched 14 of 56 precise bitrate labels. Reclassifying the retained cutoffs by the nearest granular tier maps 37 of 56 to the same tier, but performance remains highly uneven by label and is not a held-out result.
+- No held-out, multi-encoder ground-truth corpus currently validates thresholds, feature weights, confidence percentages, or false-positive rates. Runtime-generated fixtures provide regression evidence but are not a calibration set.
 - The current detector is therefore an implemented experimental baseline, not a calibrated final engine.
 
 ---
@@ -86,7 +90,7 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 - Batch analysis is sequential and has no cancellation path.
 - Result arrays are repeatedly replaced during a run, although file-based result identity is now stable.
 - Spectrogram rendering reads the complete file and creates two duration-proportional images, causing unbounded memory growth.
-- File corruption detection is limited to whether native decoding throws an error.
+- The normal result path still samples rather than decoding every frame. A full-stream evidence seam now records read errors, duration shortfall, clipped-sample ratio, peak amplitude, and longest silence, but it is not yet integrated because the extra pass needs cancellation, concurrency, and independently justified defect thresholds.
 
 ### Product and project consistency
 
@@ -114,6 +118,7 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 - [x] Replace the template unit test with deterministic coverage for codec routing, mapping, labels, sampling, all-channel analysis, and result identity
 - [x] Add focused cutoff-fusion, metadata extraction, confidence, and verdict tests
 - [x] Add runtime-generated native AAC, ALAC, FLAC, and AAC-to-ALAC cases from a deterministic known source
+- [x] Add an opt-in read-only external filename-labelled corpus evaluator
 - [ ] Expand independently generated fixtures across MP3, AAC-LC, HE-AAC, Opus, WAV, AIFF, encoder modes, and additional lossless transcodes
 - [ ] Cover CBR, ABR, VBR, encoder-defined low-pass settings, mono/stereo, bit depth, and common sample rates
 - [x] Create initial independently labelled genuine-lossless and AAC-to-lossless transcode material from a deterministic known source
@@ -164,6 +169,7 @@ Current codec cutoff tables, formulas, and thresholds are maintained in `CALCULA
 - [ ] Detect clipping and sustained inter-sample peak risk where practical
 - [ ] Validate declared duration against decoded frame duration
 - [ ] Detect truncated, malformed, unreadable, and internally inconsistent streams
+- [x] Implement raw full-stream evidence for decode errors, frame shortfall, sample clipping, peak amplitude, and long silence
 - [ ] Investigate codec residue, quantisation-noise, low-pass shape, pre-echo, and spectral-texture features
 - [ ] Combine independent feature families through a calibrated classifier when the corpus supports it
 - [ ] Add optional playback with navigation to suspicious regions

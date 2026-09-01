@@ -39,6 +39,16 @@ struct BitCheckTests {
         #expect(CodecProfile.opus.classifyContinuous(cutoffHz: 15_500, sampleRate: 48_000).label == "128 kbps")
     }
 
+    @Test func validCutoffsUseTheNearestGranularTierAcrossReferenceGaps() {
+        let formerGap = CodecProfile.mp3.classifyContinuous(cutoffHz: 16_600, sampleRate: 44_100)
+        let invalid = CodecProfile.mp3.classifyContinuous(cutoffHz: .nan, sampleRate: 44_100)
+
+        #expect(formerGap.label == "128 kbps")
+        #expect(formerGap.score >= 0.30)
+        #expect(invalid.label == "unknown")
+        #expect(invalid.score == 0)
+    }
+
     @Test func onlyIndependentFilenameLabelsAreTrainable() {
         let explicit = TrainingLabelParser.parse(fileName: "reference [REAL 128]", reportedBitrate: "320 kbps")
         let unlabelled = TrainingLabelParser.parse(fileName: "ordinary track", reportedBitrate: "320 kbps")
@@ -117,7 +127,8 @@ struct BitCheckTests {
     }
 
     @Test func generatedPCMFixtureExposesContainerAndCodecSeparately() throws {
-        let fileURL = URL(fileURLWithPath: "/tmp/bit-check-\(UUID().uuidString).wav")
+        let fileURL = FileManager.default.temporaryDirectory
+            .appending(path: "bit-check-\(UUID().uuidString).wav")
         defer { try? FileManager.default.removeItem(at: fileURL) }
         let format = try #require(AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2))
         do {
@@ -132,6 +143,20 @@ struct BitCheckTests {
         #expect(metadata.containerName == "WAV")
         #expect(metadata.codecName == "Lossless")
         #expect(metadata.displayFormat == "WAV · Lossless")
+    }
+
+    @Test func fullStreamReadCapturesClippingAndSilenceEvidence() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appending(path: "bit-check-technical-quality-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        try writeTechnicalQualitySource(to: fileURL)
+
+        let evidence = NativeTrueBitrateAnalyzer.inspectStreamIntegrity(file: fileURL)
+        #expect(evidence.readError == nil)
+        #expect(evidence.missingFrames == 0)
+        #expect(evidence.peakAmplitude >= 0.999)
+        #expect(evidence.clippingRatio > 0.20)
+        #expect(evidence.longestSilenceSeconds >= 1.9)
     }
 
     @Test func nativeCodecCorpusSeparatesGenuineAndTranscodedLossless() throws {
@@ -227,6 +252,104 @@ struct BitCheckTests {
         #expect(first.id == fileURL.standardizedFileURL.path)
     }
 
+    /// Opt-in evaluator for an external, filename-labelled audio corpus.
+    ///
+    /// Set `BITCHECK_EVALUATION_CORPUS` to a directory and optionally
+    /// `BITCHECK_EVALUATION_OUTPUT` to a CSV path. The corpus is only read;
+    /// the report is written to the separate output path.
+    @Test func externalFilenameLabelCorpusEvaluation() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let corpusPath = environment["BITCHECK_EVALUATION_CORPUS"], !corpusPath.isEmpty else {
+            return
+        }
+
+        let corpusURL = URL(fileURLWithPath: corpusPath, isDirectory: true)
+        let files = try externalCorpusFiles(in: corpusURL)
+        let outputPath = environment["BITCHECK_EVALUATION_OUTPUT"]
+            ?? FileManager.default.temporaryDirectory
+                .appending(path: "bitcheck-external-corpus.csv")
+                .path
+        let outputURL = URL(fileURLWithPath: outputPath)
+
+        var rows = [[
+            "file_name",
+            "reference_label",
+            "reference_label_type",
+            "is_scored",
+            "reported_bitrate",
+            "predicted_bitrate",
+            "is_match",
+            "analysis_succeeded",
+            "analysis_status",
+            "confidence_percent",
+            "cutoff_khz",
+            "gradient_cutoff_khz",
+            "energy_cutoff_khz",
+            "noise_floor_cutoff_khz",
+            "cutoff_agreement",
+            "evidence_confidence",
+            "classification_confidence",
+            "integrity_defective",
+            "declared_frames",
+            "decoded_frames",
+            "shortfall_seconds",
+            "shortfall_ratio",
+            "integrity_read_error",
+            "clipped_samples",
+            "clipping_ratio",
+            "peak_amplitude",
+            "longest_silence_seconds",
+        ]]
+
+        for (index, fileURL) in files.enumerated() {
+            let result = NativeTrueBitrateAnalyzer.analyze(file: fileURL)
+            let integrity = NativeTrueBitrateAnalyzer.inspectStreamIntegrity(file: fileURL)
+            let expectation = TrainingLabelParser.parse(
+                fileName: fileURL.deletingPathExtension().lastPathComponent,
+                reportedBitrate: result.reportedBitrate
+            )
+            let prediction = TrainingLabelParser.normalize(result.actualBitrate)
+            let isMatch = expectation.isTrainable ? expectation.label == prediction : nil
+            let features = result.features
+            rows.append([
+                fileURL.lastPathComponent,
+                expectation.label,
+                expectation.type,
+                expectation.isTrainable ? "true" : "false",
+                result.reportedBitrate,
+                result.actualBitrate,
+                isMatch.map { $0 ? "true" : "false" } ?? "",
+                result.success ? "true" : "false",
+                result.analysisStatus,
+                result.confidence,
+                features?.cutoffKHzText ?? "",
+                features?.gradientCutoffKHzText ?? "",
+                features?.energyCutoffKHzText ?? "",
+                features?.noiseFloorCutoffKHzText ?? "",
+                features?.cutoffAgreementText ?? "",
+                features?.evidenceConfidenceText ?? "",
+                features?.classificationConfidenceText ?? "",
+                integrity.isTechnicallyDefective ? "true" : "false",
+                String(integrity.declaredFrames),
+                String(integrity.decodedFrames),
+                String(format: "%.6f", integrity.shortfallSeconds),
+                String(format: "%.6f", integrity.shortfallRatio),
+                integrity.readError ?? "",
+                String(integrity.clippedSamples),
+                String(format: "%.9f", integrity.clippingRatio),
+                String(format: "%.6f", integrity.peakAmplitude),
+                String(format: "%.6f", integrity.longestSilenceSeconds),
+            ])
+            print("Evaluated external corpus file \(index + 1) of \(files.count)")
+        }
+
+        let csv = rows
+            .map { $0.map(Self.csvEscape).joined(separator: ",") }
+            .joined(separator: "\n") + "\n"
+        try csv.write(to: outputURL, atomically: true, encoding: .utf8)
+        print("External corpus report: \(outputURL.path)")
+    }
+
     @MainActor
     private func result(for fileURL: URL) -> ValidationResult {
         ValidationResult(
@@ -274,6 +397,34 @@ struct BitCheckTests {
         )
     }
 
+    private func externalCorpusFiles(in directory: URL) throws -> [URL] {
+        let supportedExtensions: Set<String> = [
+            "aac", "aif", "aiff", "alac", "flac", "m4a", "mp3", "ogg", "opus", "wav",
+        ]
+        let keys: [URLResourceKey] = [.isRegularFileKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles]
+        ) else {
+            throw CorpusError.cannotEnumerate(directory.path)
+        }
+
+        var files: [URL] = []
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(forKeys: Set(keys))
+            if values.isRegularFile == true,
+               supportedExtensions.contains(fileURL.pathExtension.lowercased()) {
+                files.append(fileURL)
+            }
+        }
+        return files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+    }
+
+    private static func csvEscape(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+    }
+
     private func writeBroadbandSource(to fileURL: URL, durationSeconds: Int) throws {
         let sampleRate = 48_000
         let format = try #require(
@@ -291,6 +442,34 @@ struct BitCheckTests {
             channelData[0][frame] = sample
             channelData[1][frame] = -sample
         }
+        let file = try AVAudioFile(forWriting: fileURL, settings: format.settings)
+        try file.write(from: buffer)
+    }
+
+    private func writeTechnicalQualitySource(to fileURL: URL) throws {
+        let sampleRate = 48_000
+        let frameCount = AVAudioFrameCount(sampleRate * 4)
+        let format = try #require(
+            AVAudioFormat(standardFormatWithSampleRate: Double(sampleRate), channels: 2)
+        )
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount))
+        buffer.frameLength = frameCount
+        let channelData = try #require(buffer.floatChannelData)
+
+        for frame in 0..<Int(frameCount) {
+            let sample: Float
+            switch frame {
+            case 0..<sampleRate:
+                sample = frame.isMultiple(of: 2) ? 1 : -1
+            case sampleRate..<(sampleRate * 3):
+                sample = 0
+            default:
+                sample = 0.25
+            }
+            channelData[0][frame] = sample
+            channelData[1][frame] = sample
+        }
+
         let file = try AVAudioFile(forWriting: fileURL, settings: format.settings)
         try file.write(from: buffer)
     }
@@ -344,5 +523,6 @@ struct BitCheckTests {
 
     private enum CorpusError: Error {
         case conversionFailed(source: String, destination: String, message: String)
+        case cannotEnumerate(String)
     }
 }

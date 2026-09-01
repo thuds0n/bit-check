@@ -277,22 +277,44 @@ Classification uses distance-weighted scoring over absolute Hz threshold ranges.
 
 ```
 func classifyContinuous(cutoffHz, sampleRate):
-    for each bucket (lo, hi, center, label) in codecBuckets:
-        spread = (hi - lo) × 0.55
+    if cutoffHz is not finite or cutoffHz ≤ 0:
+        return ("unknown", 0)
 
-        if lo ≤ cutoffHz ≤ hi:
-            score = exp(-|cutoffHz - center| / spread)
-            score = clamp(score, 0.30, 0.99)
-        else if distance_to_range < spread × 2:
-            score = exp(-|cutoffHz - center| / spread) × 0.80
-        else:
-            skip
+    nearest = bucket whose centre has the smallest absolute distance from cutoffHz
+    spread  = max(100 Hz, (nearest.hi - nearest.lo) × 0.55)
+    score   = exp(-|cutoffHz - nearest.center| / spread)
+    score   = clamp(score, 0.30, 0.99)
 
-    return (best matching label, best score)
-    if no match: return ("unknown", 0.35)
+    return (nearest.label, score)
 ```
 
-The exponential distance score handles edge cases continuously rather than snapping every cutoff directly to a bucket. The bucket ranges themselves remain provisional until validated against independently labelled encodes.
+The named tiers form the product's granular bitrate vocabulary. A valid cutoff always receives the nearest tier, while distance continuously reduces confidence; falling into a narrow gap between provisional ranges no longer erases the estimate. The bucket centres and ranges remain provisional until validated against independently generated, encoder-diverse material.
+
+---
+
+## Full-Stream Technical Evidence
+
+An opt-in full-stream pass now exposes raw evidence for technical-quality evaluation. It is deliberately separate from the quick spectral result path until batch cancellation, bounded concurrency, and defect thresholds are ready.
+
+```
+chunkFrames = 32768
+
+while decoded frames remain:
+    decode one PCM chunk for every channel
+    decodedFrames += chunk.frameLength
+    peakAmplitude = max(peakAmplitude, max(abs(samples)))
+    clippedSamples += count(abs(sample) ≥ 0.999)
+
+    framePeak = maximum absolute sample across channels for each frame
+    longestSilentFrames = longest consecutive run where framePeak < 0.001  // below -60 dBFS
+
+clippingRatio        = clippedSamples / (decodedFrames × channelCount)
+longestSilence       = longestSilentFrames / sampleRate
+durationShortfall    = max(0, declaredFrames - decodedFrames) / sampleRate
+durationShortfallPct = max(0, declaredFrames - decodedFrames) / declaredFrames
+```
+
+A full-read error is technical defect evidence. A duration shortfall must exceed both one second and 0.5% of the declared frames to avoid normal codec padding. Clipping and silence are currently retained as measurements rather than converted directly into a defect verdict: both are programme-dependent, and the available composite labels do not reveal which user-configurable check produced them.
 
 ---
 

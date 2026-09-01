@@ -1061,6 +1061,136 @@ nonisolated enum NativeTrueBitrateAnalyzer {
         }
     }
 
+    static func inspectStreamIntegrity(file: URL) -> StreamIntegrityEvidence {
+        do {
+            let audioFile = try AVAudioFile(forReading: file)
+            let format = audioFile.processingFormat
+            let sampleRate = format.sampleRate
+            guard sampleRate > 0 else {
+                return StreamIntegrityEvidence(
+                    declaredFrames: audioFile.length,
+                    decodedFrames: 0,
+                    sampleRate: sampleRate,
+                    channelCount: Int(format.channelCount),
+                    clippedSamples: 0,
+                    longestSilentFrames: 0,
+                    peakAmplitude: 0,
+                    readError: "Unsupported sample rate"
+                )
+            }
+
+            let declaredFrames = max(0, audioFile.length)
+            let chunkFrames: AVAudioFrameCount = 32_768
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else {
+                return StreamIntegrityEvidence(
+                    declaredFrames: declaredFrames,
+                    decodedFrames: 0,
+                    sampleRate: sampleRate,
+                    channelCount: Int(format.channelCount),
+                    clippedSamples: 0,
+                    longestSilentFrames: 0,
+                    peakAmplitude: 0,
+                    readError: "Failed to allocate integrity buffer"
+                )
+            }
+
+            audioFile.framePosition = 0
+            var decodedFrames: AVAudioFramePosition = 0
+            var clippedSamples: Int64 = 0
+            var currentSilentFrames: AVAudioFramePosition = 0
+            var longestSilentFrames: AVAudioFramePosition = 0
+            var peakAmplitude: Float = 0
+            var readError: String?
+
+            while declaredFrames == 0 || decodedFrames < declaredFrames {
+                let requestedFrames: AVAudioFrameCount
+                if declaredFrames == 0 {
+                    requestedFrames = chunkFrames
+                } else {
+                    requestedFrames = AVAudioFrameCount(
+                        min(AVAudioFramePosition(chunkFrames), declaredFrames - decodedFrames)
+                    )
+                }
+
+                do {
+                    try audioFile.read(into: buffer, frameCount: requestedFrames)
+                } catch {
+                    readError = error.localizedDescription
+                    break
+                }
+
+                guard buffer.frameLength > 0 else { break }
+                let channels = try extractChannelData(from: buffer)
+                let frameCount = Int(buffer.frameLength)
+                var framePeaks = [Float](repeating: 0, count: frameCount)
+                var magnitudes = [Float](repeating: 0, count: frameCount)
+                var thresholdFlags = [Float](repeating: 0, count: frameCount)
+                var clippingThreshold: Float = 0.999
+                var marker: Float = 1
+
+                for channel in channels {
+                    vDSP_vabs(channel, 1, &magnitudes, 1, vDSP_Length(frameCount))
+                    vDSP_vmax(
+                        framePeaks,
+                        1,
+                        magnitudes,
+                        1,
+                        &framePeaks,
+                        1,
+                        vDSP_Length(frameCount)
+                    )
+                    vDSP_vthrsc(
+                        magnitudes,
+                        1,
+                        &clippingThreshold,
+                        &marker,
+                        &thresholdFlags,
+                        1,
+                        vDSP_Length(frameCount)
+                    )
+                    var signedSum: Float = 0
+                    vDSP_sve(thresholdFlags, 1, &signedSum, vDSP_Length(frameCount))
+                    clippedSamples += Int64(((signedSum + Float(frameCount)) * 0.5).rounded())
+                }
+
+                var bufferPeak: Float = 0
+                vDSP_maxv(framePeaks, 1, &bufferPeak, vDSP_Length(frameCount))
+                peakAmplitude = max(peakAmplitude, bufferPeak)
+                for framePeak in framePeaks {
+                    if framePeak < 0.001 {
+                        currentSilentFrames += 1
+                        longestSilentFrames = max(longestSilentFrames, currentSilentFrames)
+                    } else {
+                        currentSilentFrames = 0
+                    }
+                }
+                decodedFrames += AVAudioFramePosition(buffer.frameLength)
+            }
+
+            return StreamIntegrityEvidence(
+                declaredFrames: declaredFrames,
+                decodedFrames: decodedFrames,
+                sampleRate: sampleRate,
+                channelCount: Int(format.channelCount),
+                clippedSamples: clippedSamples,
+                longestSilentFrames: longestSilentFrames,
+                peakAmplitude: peakAmplitude,
+                readError: readError
+            )
+        } catch {
+            return StreamIntegrityEvidence(
+                declaredFrames: 0,
+                decodedFrames: 0,
+                sampleRate: 0,
+                channelCount: 0,
+                clippedSamples: 0,
+                longestSilentFrames: 0,
+                peakAmplitude: 0,
+                readError: error.localizedDescription
+            )
+        }
+    }
+
     static func analyze(file: URL) -> RunResult {
         do {
             let samples = try loadSamples(from: file, maxSeconds: 30)
@@ -1854,36 +1984,20 @@ nonisolated enum CodecProfile: Equatable {
     func classifyContinuous(cutoffHz: Double, sampleRate: Int) -> (label: String, score: Double) {
         _ = sampleRate
         let buckets = referenceBuckets
-        var bestLabel = "unknown"
-        var bestScore = 0.35
-
-        for bucket in buckets {
-            let lo = bucket.lo
-            let hi = bucket.hi
-            let center = bucket.center
-
-            if cutoffHz >= lo && cutoffHz <= hi {
-                let spread = (hi - lo) * 0.55
-                let score = distanceScore(cutoffHz, center: center, spread: spread)
-                if score > bestScore {
-                    bestScore = score
-                    bestLabel = bucket.label
-                }
-            } else {
-                // Allow near-misses with reduced score
-                let distance = cutoffHz < lo ? lo - cutoffHz : cutoffHz - hi
-                let spread = (hi - lo) * 0.55
-                if distance < spread * 2 {
-                    let score = distanceScore(cutoffHz, center: center, spread: spread) * 0.8
-                    if score > bestScore {
-                        bestScore = score
-                        bestLabel = bucket.label
-                    }
-                }
-            }
+        guard cutoffHz.isFinite, cutoffHz > 0,
+              let nearest = buckets.min(by: {
+                  abs(cutoffHz - $0.center) < abs(cutoffHz - $1.center)
+              }) else {
+            return ("unknown", 0)
         }
 
-        return (bestLabel, bestScore)
+        // The named tiers are a product vocabulary, while the confidence
+        // remains continuous. Always return the nearest tier for a valid
+        // cutoff; gaps between provisional reference ranges should reduce the
+        // score rather than erase the estimate altogether.
+        let spread = max(100, (nearest.hi - nearest.lo) * 0.55)
+        let score = distanceScore(cutoffHz, center: nearest.center, spread: spread)
+        return (nearest.label, score)
     }
 
     private func distanceScore(_ value: Double, center: Double, spread: Double) -> Double {
@@ -1891,6 +2005,54 @@ nonisolated enum CodecProfile: Equatable {
         let distance = abs(value - center)
         let score = exp(-distance / spread)
         return max(0.30, min(0.99, score))
+    }
+}
+
+nonisolated struct StreamIntegrityEvidence: Equatable {
+    let declaredFrames: AVAudioFramePosition
+    let decodedFrames: AVAudioFramePosition
+    let sampleRate: Double
+    let channelCount: Int
+    let clippedSamples: Int64
+    let longestSilentFrames: AVAudioFramePosition
+    let peakAmplitude: Float
+    let readError: String?
+
+    var missingFrames: AVAudioFramePosition {
+        max(0, declaredFrames - decodedFrames)
+    }
+
+    var shortfallSeconds: Double {
+        guard sampleRate > 0 else { return 0 }
+        return Double(missingFrames) / sampleRate
+    }
+
+    var shortfallRatio: Double {
+        guard declaredFrames > 0 else { return 0 }
+        return Double(missingFrames) / Double(declaredFrames)
+    }
+
+    var clippingRatio: Double {
+        let decodedSamples = decodedFrames * AVAudioFramePosition(channelCount)
+        guard decodedSamples > 0 else { return 0 }
+        return Double(clippedSamples) / Double(decodedSamples)
+    }
+
+    var longestSilenceSeconds: Double {
+        guard sampleRate > 0 else { return 0 }
+        return Double(longestSilentFrames) / sampleRate
+    }
+
+    /// A full read error is always material. Frame-count shortfalls need to
+    /// exceed both normal codec padding and one second of programme material.
+    var isTechnicallyDefective: Bool {
+        if readError != nil { return true }
+        guard declaredFrames > 0 else { return false }
+        let toleranceFrames = max(
+            AVAudioFramePosition(sampleRate.rounded()),
+            AVAudioFramePosition((Double(declaredFrames) * 0.005).rounded())
+        )
+        return missingFrames > toleranceFrames
     }
 }
 
